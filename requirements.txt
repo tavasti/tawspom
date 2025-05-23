@@ -1,0 +1,4 @@
+# requirements.txt
+spotipy
+python-dotenv
+
