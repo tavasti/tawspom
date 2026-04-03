@@ -1,32 +1,62 @@
 import sqlite3
-from pathlib import Path
+import os
 
-DB_PATH = Path.home() / ".tawspom" / "tawspom.db"
+DB_PATH = os.path.expanduser("~/.local/share/tawspom/tawspom.sqlite3")
+DB_VERSION = 1
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tracks (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                artist TEXT,
-                added_at TEXT,
-                last_played TEXT,
-                duplicate_checked INTEGER DEFAULT 0
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                track_id TEXT,
-                action_type TEXT,
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cur.execute("SELECT value FROM meta WHERE key = 'version'")
+    row = cur.fetchone()
+    current_version = int(row[0]) if row else 0
+
+    if current_version < 1:
+        cur.execute("""
+            CREATE TABLE track (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                artist TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE playlist_track (
+                playlist_id TEXT,
+                track_id TEXT,
+                position INTEGER,
+                PRIMARY KEY (playlist_id, track_id),
+                FOREIGN KEY (track_id) REFERENCES track(id)
+            )
+        """)
+        current_version = DB_VERSION
+
+    if current_version < DB_VERSION:
+        # Future migration step(s) here
+        current_version = DB_VERSION
+
+    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?)", (str(DB_VERSION),))
+    conn.commit()
+    return conn
+
+def insert_playlist_tracks(conn, playlist_id: str, tracks: list[dict]):
+    cur = conn.cursor()
+    for pos, track in enumerate(tracks):
+        track_id = track["id"]
+        name = track["name"]
+        artist = ", ".join([a["name"] for a in track["artists"]])
+
+        cur.execute("INSERT OR IGNORE INTO track (id, name, artist) VALUES (?, ?, ?)",
+                    (track_id, name, artist))
+        cur.execute("INSERT OR REPLACE INTO playlist_track (playlist_id, track_id, position) VALUES (?, ?, ?)",
+                    (playlist_id, track_id, pos))
+    conn.commit()
 

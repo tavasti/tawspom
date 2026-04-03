@@ -1,0 +1,14 @@
+# Byte-compiled files
+__pycache__/
+# Virtual environment
+.venv/
+# Spotify credentials
+.env
+# IDE specific files
+.vscode/
+*.pyc
+*.pyo
+*.pyd
+# Specific files/dirs to ignore
+# __pycache__ directories
+**/__pycache__/
