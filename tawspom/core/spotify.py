@@ -1,25 +1,48 @@
 import os
+import time
 from typing import List, Optional
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from requests.exceptions import ConnectionError
+from urllib3.exceptions import ProtocolError
 from tawspom.models import Track, Playlist
 
 load_dotenv()
 
 class SpotifyClient:
     def __init__(self, user_label: str = "default", scope=None):
-        cache_path = os.path.expanduser(f"~/.tawspom/token_{user_label}.json")
+        self.user_label = user_label
+        self.scope = scope or "user-library-read user-library-modify user-read-playback-state playlist-read-private playlist-modify-private playlist-modify-public"
+        self._init_sp()
+
+    def _init_sp(self):
+        """Initializes or re-initializes the Spotify client."""
+        cache_path = os.path.expanduser(f"~/.tawspom/token_{self.user_label}.json")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         
         self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-            scope=scope or "user-library-read user-library-modify user-read-playback-state playlist-read-private playlist-modify-private playlist-modify-public",
+            scope=self.scope,
             client_id=os.getenv("SPOTIPY_CLIENT_ID"),
             client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
             redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
             cache_path=cache_path,
             open_browser=False
         ))
+
+    def _call_with_retry(self, func, *args, **kwargs):
+        """Wraps a Spotify API call with a retry mechanism for connection errors."""
+        max_retries = 3
+        for i in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (ConnectionError, ProtocolError) as e:
+                if i == max_retries - 1:
+                    raise
+                print(f"\nConnection error: {e}. Retrying in 2 seconds... (Attempt {i+1}/{max_retries})")
+                time.sleep(2)
+                self._init_sp() # Re-init client just in case it helps
+        return None
 
     def get_storage_playlists(self) -> List[Playlist]:
         """Fetches all playlists that have a single-character name (A-Z)."""
@@ -28,7 +51,7 @@ class SpotifyClient:
         limit = 50
 
         while True:
-            response = self.sp.current_user_playlists(limit=limit, offset=offset)
+            response = self._call_with_retry(self.sp.current_user_playlists, limit=limit, offset=offset)
             items = response.get("items", [])
             for item in items:
                 if len(item["name"]) == 1 and item["name"].isalpha():
@@ -42,12 +65,12 @@ class SpotifyClient:
 
     def search_artist(self, name: str) -> List[dict]:
         """Returns a list of the top 30 artists found matching the name, including top tracks."""
-        results = self.sp.search(q=f"artist:{name}", type="artist", limit=30)
+        results = self._call_with_retry(self.sp.search, q=f"artist:{name}", type="artist", limit=30)
         items = results.get("artists", {}).get("items", [])
         
         artists = []
         for item in items:
-            top_tracks_res = self.sp.artist_top_tracks(item["id"])
+            top_tracks_res = self._call_with_retry(self.sp.artist_top_tracks, item["id"])
             top_tracks = top_tracks_res.get("tracks", [])[:3]
             top_songs_summary = ", ".join([t["name"][:20] for t in top_tracks])
             
@@ -65,7 +88,7 @@ class SpotifyClient:
         albums = []
         offset = 0
         while True:
-            result = self.sp.artist_albums(artist_id, album_type="album", limit=50, offset=offset)
+            result = self._call_with_retry(self.sp.artist_albums, artist_id, album_type="album", limit=50, offset=offset)
             albums.extend(result["items"])
             if not result["next"]:
                 break
@@ -86,8 +109,9 @@ class SpotifyClient:
 
     def create_playlist(self, name: str) -> Playlist:
         """Creates a new private playlist."""
-        user_id = self.sp.current_user()["id"]
-        res = self.sp.user_playlist_create(user_id, name, public=False)
+        user = self._call_with_retry(self.sp.current_user)
+        user_id = user["id"]
+        res = self._call_with_retry(self.sp.user_playlist_create, user_id, name, public=False)
         return Playlist(res["id"], res["name"])
 
     def get_album_tracks(self, album_id: str, album_name: str = "") -> List[Track]:
@@ -95,7 +119,7 @@ class SpotifyClient:
         tracks = []
         offset = 0
         while True:
-            result = self.sp.album_tracks(album_id, limit=50, offset=offset)
+            result = self._call_with_retry(self.sp.album_tracks, album_id, limit=50, offset=offset)
             items = result.get("items", [])
             for t in items:
                 artist_names = ", ".join([a["name"] for a in t["artists"]])
@@ -119,13 +143,14 @@ class SpotifyClient:
         limit = 100
 
         while True:
-            result = self.sp.playlist_items(playlist_id, limit=limit, offset=offset)
+            result = self._call_with_retry(self.sp.playlist_items, playlist_id, limit=limit, offset=offset)
             items = result.get("items", [])
             for item in items:
                 t = item.get("track")
                 if t:
                     artist_names = ", ".join([a["name"] for a in t["artists"]])
-                    album_name = t.get("album", {}).get("name", "")
+                    album_obj = t.get("album")
+                    album_name = album_obj.get("name", "") if album_obj else ""
                     tracks.append(Track(
                         id=t["id"],
                         name=t["name"],
@@ -147,13 +172,14 @@ class SpotifyClient:
         offset = 0
         limit = 50
         while True:
-            result = self.sp.current_user_saved_tracks(limit=limit, offset=offset)
+            result = self._call_with_retry(self.sp.current_user_saved_tracks, limit=limit, offset=offset)
             items = result.get("items", [])
             for item in items:
                 t = item.get("track")
                 if t:
                     artist_names = ", ".join([a["name"] for a in t["artists"]])
-                    album_name = t.get("album", {}).get("name", "")
+                    album_obj = t.get("album")
+                    album_name = album_obj.get("name", "") if album_obj else ""
                     tracks.append(Track(
                         id=t["id"],
                         name=t["name"],
@@ -171,15 +197,14 @@ class SpotifyClient:
         """Removes tracks from 'Liked Songs'. Batches of 50."""
         if not track_ids: return
         for i in range(0, len(track_ids), 50):
-            # spotipy's current_user_saved_tracks_delete takes a list of IDs
-            self.sp.current_user_saved_tracks_delete(tracks=track_ids[i:i+50])
+            self._call_with_retry(self.sp.current_user_saved_tracks_delete, tracks=track_ids[i:i+50])
 
     def get_active_playlist(self, name: str) -> Optional[Playlist]:
         """Finds or creates an 'Active' playlist by name."""
         offset = 0
         limit = 50
         while True:
-            response = self.sp.current_user_playlists(limit=limit, offset=offset)
+            response = self._call_with_retry(self.sp.current_user_playlists, limit=limit, offset=offset)
             items = response.get("items", [])
             for item in items:
                 if item["name"] == name:
@@ -188,27 +213,28 @@ class SpotifyClient:
                 break
             offset += limit
         
-        user_id = self.sp.current_user()["id"]
-        new_pl = self.sp.user_playlist_create(user_id, name, public=False)
+        user = self._call_with_retry(self.sp.current_user)
+        user_id = user["id"]
+        new_pl = self._call_with_retry(self.sp.user_playlist_create, user_id, name, public=False)
         return Playlist(new_pl["id"], new_pl["name"], is_active=True)
 
     def get_current_playback(self) -> Optional[dict]:
         """Returns the currently playing track ID and context."""
-        return self.sp.current_playback()
+        return self._call_with_retry(self.sp.current_playback)
 
     def remove_tracks_from_playlist(self, playlist_id: str, track_ids: List[str]):
         """Removes a list of tracks from a playlist."""
         if not track_ids:
             return
         for i in range(0, len(track_ids), 100):
-            self.sp.playlist_remove_all_occurrences_of_items(playlist_id, track_ids[i:i+100])
+            self._call_with_retry(self.sp.playlist_remove_all_occurrences_of_items, playlist_id, track_ids[i:i+100])
 
     def add_tracks_to_playlist(self, playlist_id: str, track_ids: List[str]):
         """Adds a list of tracks to a playlist."""
         if not track_ids:
             return
         for i in range(0, len(track_ids), 100):
-            self.sp.playlist_add_items(playlist_id, track_ids[i:i+100])
+            self._call_with_retry(self.sp.playlist_add_items, playlist_id, track_ids[i:i+100])
 
     def get_playlist_tracks_ordered(self, playlist_id: str) -> List[str]:
         """Returns track IDs in the order they appear in the playlist."""
@@ -216,7 +242,7 @@ class SpotifyClient:
         offset = 0
         limit = 100
         while True:
-            result = self.sp.playlist_items(playlist_id, fields="items(track(id))", limit=limit, offset=offset)
+            result = self._call_with_retry(self.sp.playlist_items, playlist_id, fields="items(track(id))", limit=limit, offset=offset)
             items = result.get("items", [])
             track_ids.extend([item["track"]["id"] for item in items if item.get("track")])
             if len(items) < limit:

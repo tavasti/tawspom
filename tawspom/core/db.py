@@ -18,11 +18,10 @@ def init_db():
         )
     """)
 
-    # Transaction table with cancels_id
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL, -- 'ADD', 'DELETE', or 'INGEST'
+            type TEXT NOT NULL, 
             timestamp TEXT NOT NULL,
             track_count INTEGER NOT NULL,
             description TEXT,
@@ -32,7 +31,6 @@ def init_db():
         )
     """)
 
-    # Track table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS track (
             id TEXT PRIMARY KEY,
@@ -52,7 +50,6 @@ def init_db():
         )
     """)
 
-    # Active tracks table (to detect manual removals)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS active_tracks (
             track_id TEXT PRIMARY KEY,
@@ -61,7 +58,7 @@ def init_db():
         )
     """)
 
-    # Migration check for existing installations
+    # Migrations
     cur.execute("PRAGMA table_info(track)")
     cols = [col[1] for col in cur.fetchall()]
     if 'album' not in cols:
@@ -98,9 +95,20 @@ def set_transaction_cancelled_status(conn, trans_id: int, cancelled: bool):
     cur.execute("UPDATE transactions SET is_cancelled = ? WHERE id = ?", (1 if cancelled else 0, trans_id))
     conn.commit()
 
-def upsert_track(conn, track: Track):
+def upsert_tracks(conn, tracks: List[Track]):
+    """Bulk upsert tracks for speed."""
+    if not tracks: return
     cur = conn.cursor()
-    cur.execute("""
+    data = []
+    for t in tracks:
+        data.append((
+            t.id, t.name, t.artist, t.album, t.duration_ms, t.storage_playlist_id,
+            t.last_played_at.isoformat() if t.last_played_at else None,
+            t.added_at.isoformat() if t.added_at else None,
+            0, t.add_transaction_id
+        ))
+    
+    cur.executemany("""
         INSERT INTO track (id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, 
                           added_at, is_deleted, add_transaction_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -114,35 +122,23 @@ def upsert_track(conn, track: Track):
             is_deleted=0,
             deleted_at=NULL,
             add_transaction_id=COALESCE(excluded.add_transaction_id, track.add_transaction_id)
-    """, (track.id, track.name, track.artist, track.album, track.duration_ms, track.storage_playlist_id, 
-          track.last_played_at.isoformat() if track.last_played_at else None,
-          track.added_at.isoformat() if track.added_at else None,
-          0, track.add_transaction_id))
+    """, data)
     conn.commit()
+
+def upsert_track(conn, track: Track):
+    upsert_tracks(conn, [track])
 
 def mark_tracks_deleted(conn, track_ids: List[str], transaction_id: int):
     cur = conn.cursor()
     now = datetime.now().isoformat()
-    for tid in track_ids:
-        cur.execute("""
-            UPDATE track SET 
-                is_deleted = 1, 
-                deleted_at = ?, 
-                delete_transaction_id = ? 
-            WHERE id = ?
-        """, (now, transaction_id, tid))
+    # Batch update for deletions
+    cur.execute(f"UPDATE track SET is_deleted = 1, deleted_at = ?, delete_transaction_id = ? WHERE id IN ({','.join(['?']*len(track_ids))})", 
+                [now, transaction_id] + track_ids)
     conn.commit()
 
 def unmark_tracks_deleted(conn, track_ids: List[str]):
     cur = conn.cursor()
-    for tid in track_ids:
-        cur.execute("""
-            UPDATE track SET 
-                is_deleted = 0, 
-                deleted_at = NULL, 
-                delete_transaction_id = NULL 
-            WHERE id = ?
-        """, (tid,))
+    cur.execute(f"UPDATE track SET is_deleted = 0, deleted_at = NULL, delete_transaction_id = NULL WHERE id IN ({','.join(['?']*len(track_ids))})", track_ids)
     conn.commit()
 
 def get_transaction(conn, trans_id: int) -> Optional[Transaction]:
@@ -168,63 +164,43 @@ def get_tracks_by_transaction(conn, trans_id: int, trans_type: str) -> List[Trac
     col = "add_transaction_id" if trans_type in ["ADD", "INGEST"] else "delete_transaction_id"
     cur.execute(f"""
         SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id
-        FROM track 
-        WHERE {col} = ?
+        FROM track WHERE {col} = ?
     """, (trans_id,))
     
     tracks = []
     for row in cur.fetchall():
-        tracks.append(Track(
-            id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
+        tracks.append(Track(id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
             last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
             added_at=datetime.fromisoformat(row[7]) if row[7] else None,
             deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            is_deleted=bool(row[9]),
-            add_transaction_id=row[10],
-            delete_transaction_id=row[11]
-        ))
+            is_deleted=bool(row[9]), add_transaction_id=row[10], delete_transaction_id=row[11]))
     return tracks
 
 def get_tracks_by_ids(conn, track_ids: List[str]) -> List[Track]:
     if not track_ids: return []
     cur = conn.cursor()
     placeholders = ','.join(['?'] * len(track_ids))
-    cur.execute(f"""
-        SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id
-        FROM track WHERE id IN ({placeholders})
-    """, track_ids)
+    cur.execute(f"SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id FROM track WHERE id IN ({placeholders})", track_ids)
     
     tracks = []
     for row in cur.fetchall():
-        tracks.append(Track(
-            id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
+        tracks.append(Track(id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
             last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
             added_at=datetime.fromisoformat(row[7]) if row[7] else None,
             deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            is_deleted=bool(row[9]),
-            add_transaction_id=row[10],
-            delete_transaction_id=row[11]
-        ))
+            is_deleted=bool(row[9]), add_transaction_id=row[10], delete_transaction_id=row[11]))
     return tracks
 
 def get_all_active_tracks(conn) -> List[Track]:
-    """Returns all non-deleted tracks."""
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id
-        FROM track WHERE is_deleted = 0
-    """)
+    cur.execute("SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id FROM track WHERE is_deleted = 0")
     tracks = []
     for row in cur.fetchall():
-        tracks.append(Track(
-            id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
+        tracks.append(Track(id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
             last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
             added_at=datetime.fromisoformat(row[7]) if row[7] else None,
             deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            is_deleted=bool(row[9]),
-            add_transaction_id=row[10],
-            delete_transaction_id=row[11]
-        ))
+            is_deleted=bool(row[9]), add_transaction_id=row[10], delete_transaction_id=row[11]))
     return tracks
 
 def get_all_active_track_ids(conn) -> List[str]:
@@ -234,26 +210,21 @@ def get_all_active_track_ids(conn) -> List[str]:
 
 def mark_as_played(conn, track_id: str, played_at: datetime):
     cur = conn.cursor()
-    cur.execute("UPDATE track SET last_played_at = ? WHERE id = ?", 
-                (played_at.isoformat(), track_id))
+    cur.execute("UPDATE track SET last_played_at = ? WHERE id = ?", (played_at.isoformat(), track_id))
     conn.commit()
 
 def get_least_recently_played_tracks(conn, limit: int = 1000) -> List[Track]:
-    """Returns a randomized pool of the oldest tracks."""
     cur = conn.cursor()
     cur.execute("""
         SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at 
-        FROM track 
-        WHERE is_deleted = 0
+        FROM track WHERE is_deleted = 0
         ORDER BY last_played_at ASC NULLS FIRST, RANDOM()
         LIMIT ?
     """, (limit,))
-    
     tracks = []
     for row in cur.fetchall():
         last_played = datetime.fromisoformat(row[6]) if row[6] else None
         tracks.append(Track(row[0], row[1], row[2], row[3], row[4], row[5], last_played))
-        
     return tracks
 
 def delete_tracks_permanently(conn, older_than_days: int):
@@ -272,11 +243,15 @@ def add_active_tracks(conn, track_ids: List[str]):
 
 def remove_active_tracks(conn, track_ids: List[str]):
     cur = conn.cursor()
-    for tid in track_ids:
-        cur.execute("DELETE FROM active_tracks WHERE track_id = ?", (tid,))
+    cur.execute(f"DELETE FROM active_tracks WHERE track_id IN ({','.join(['?']*len(track_ids))})", track_ids)
     conn.commit()
 
 def get_tracked_active_ids(conn) -> List[str]:
     cur = conn.cursor()
     cur.execute("SELECT track_id FROM active_tracks")
     return [row[0] for row in cur.fetchall()]
+
+def get_playlist_track_count(conn, playlist_id: str) -> int:
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM track WHERE storage_playlist_id = ? AND is_deleted = 0", (playlist_id,))
+    return cur.fetchone()[0]

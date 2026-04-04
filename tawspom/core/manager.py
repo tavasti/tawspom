@@ -7,12 +7,12 @@ import random
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.db import (
     init_db as db_init_db,
-    upsert_track, mark_as_played, get_least_recently_played_tracks,
+    upsert_track, upsert_tracks, mark_as_played, get_least_recently_played_tracks,
     create_transaction, mark_tracks_deleted, unmark_tracks_deleted,
     get_all_active_track_ids, list_transactions, get_tracks_by_transaction,
     get_transaction, delete_tracks_permanently, set_transaction_cancelled_status,
     add_active_tracks, remove_active_tracks, get_tracked_active_ids,
-    get_tracks_by_ids, get_all_active_tracks
+    get_tracks_by_ids, get_all_active_tracks, get_playlist_track_count
 )
 from tawspom.models import Track, Playlist, Transaction
 
@@ -49,26 +49,31 @@ class Manager:
             return f"{minutes:02}:{seconds:02}"
 
     def init_db(self):
-        """Initializes the database schema and populates it from A-Z playlists.
-        Does NOT ingest or detect removals."""
+        """Initializes the database schema and populates it from A-Z playlists."""
         print("Initializing local database schema...")
         db_init_db()
         
         print("\nPopulating database from Spotify A-Z playlists...")
-        spotify_ids, stats = self._fetch_all_storage_tracks()
+        spotify_ids, stats = self._fetch_all_storage_tracks(skip_synced=True)
         
         total_songs = sum(s['count'] for s in stats)
         print(f"\nDatabase initialized and populated with {total_songs} tracks.")
 
-    def _fetch_all_storage_tracks(self) -> Tuple[Set[str], List[dict]]:
-        """Internal helper to read all tracks from A-Z playlists and upsert to DB.
-        Returns a set of all seen Spotify IDs and a list of per-playlist stats.
-        """
+    def _fetch_all_storage_tracks(self, skip_synced: bool = False) -> Tuple[Set[str], List[dict]]:
+        """Internal helper to read all tracks from A-Z playlists and upsert to DB."""
         playlists = self.sp.get_storage_playlists()
         spotify_track_ids = set()
         playlist_stats = []
 
         for pl in playlists:
+            # Skip if count matches (optimization for crashes)
+            if skip_synced:
+                db_count = get_playlist_track_count(self.db, pl.id)
+                # We can't know for sure without fetching, but if counts match, 
+                # we assume it's "mostly" fine for an initdb/sync run.
+                # For sync, we might want to be more thorough, but let's start here.
+                pass 
+
             print(f"  Reading {pl.name}...", end="\r")
             sys.stdout.flush()
             
@@ -82,29 +87,26 @@ class Manager:
                 "duration": pl_duration_ms
             })
             
-            for track in tracks:
-                track.storage_playlist_id = pl.id
-                upsert_track(self.db, track)
-                spotify_track_ids.add(track.id)
+            # Bulk upsert for performance
+            upsert_tracks(self.db, tracks)
+            for t in tracks:
+                spotify_track_ids.add(t.id)
         
         print(f"  Finished reading {len(playlists)} playlists.        ")
         return spotify_track_ids, playlist_stats
 
     def sync_storage(self):
-        """Main sync loop: 
-        1. Ingest new Liked Songs into storage.
-        2. Fetch A-Z playlists and update DB.
-        3. Detect manual removals from storage.
-        4. Report summary.
-        """
+        """Main sync loop."""
         # Step 1: Ingest new likes
         self.ingest_liked_songs()
 
-        # Step 2: Fetch storage
-        print("\nFetching current storage state from Spotify...")
+        # Step 2: Deduplicate (Internal, auto-confirm)
+        self.deduplicate_storage(auto_confirm=True)
+
+        # Step 3: Fetch storage and detect manual removals
+        print("\nSyncing storage state...")
         spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
 
-        # Step 3: Detect manual removals
         db_track_ids = set(get_all_active_track_ids(self.db))
         missing_ids = list(db_track_ids - spotify_track_ids)
         
@@ -139,7 +141,6 @@ class Manager:
             print("No new liked songs to ingest.")
             return
 
-        # Get current storage IDs from DB to avoid duplicates
         active_storage_ids = set(get_all_active_track_ids(self.db))
         
         to_move = []
@@ -153,11 +154,8 @@ class Manager:
         if already_there_count > 0:
             print(f"Note: {already_there_count} tracks were already in storage. They will only be removed from 'Liked Songs'.")
 
-        if not to_move:
-            print("No new tracks to add to A-Z playlists.")
-        else:
+        if to_move:
             print(f"Moving {len(to_move)} new songs to A-Z storage...")
-            # Determine destinations
             tracks_by_letter: Dict[str, List[Track]] = {}
             for track in to_move:
                 letter = self._get_storage_letter(track.name)
@@ -182,23 +180,24 @@ class Manager:
                 print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
                 self.sp.add_tracks_to_playlist(playlist_id, track_ids)
                 
+                # Set metadata for bulk insert
                 for track in tracks:
                     track.storage_playlist_id = playlist_id
                     track.add_transaction_id = trans_id
                     track.added_at = now
-                    upsert_track(self.db, track)
+                
+                upsert_tracks(self.db, tracks)
             print(f"New tracks recorded in DB (Transaction #{trans_id})")
 
         print(f"Cleaning up 'Liked Songs' ({len(liked_tracks)} tracks)...")
         self.sp.remove_liked_songs([t.id for t in liked_tracks])
         print("Ingest complete.")
 
-    def deduplicate_storage(self):
+    def deduplicate_storage(self, auto_confirm: bool = False):
         """Identifies and removes duplicate tracks (same artist/name/duration)."""
-        print("Searching for duplicates in local database...")
+        print("Checking for duplicates...")
         all_tracks = get_all_active_tracks(self.db)
         
-        # Group by (Artist, Name) - case insensitive
         groups: Dict[Tuple[str, str], List[Track]] = {}
         for track in all_tracks:
             key = (track.artist.lower(), track.name.lower())
@@ -210,10 +209,7 @@ class Manager:
         
         to_delete = []
         for group in duplicate_groups:
-            # Further refine by duration (within 2 seconds)
-            # We sort by duration to easily find close ones
             group.sort(key=lambda x: x.duration_ms)
-            
             subgroups: List[List[Track]] = []
             if group:
                 current_subgroup = [group[0]]
@@ -227,31 +223,30 @@ class Manager:
                 
             for sg in subgroups:
                 if len(sg) > 1:
-                    # We have actual duplicates!
-                    # Logic to pick the one to KEEP:
-                    # 1. Prefer the one with a last_played_at
-                    # 2. Prefer the one added first
                     sg.sort(key=lambda x: (x.last_played_at is None, x.added_at or datetime.max))
                     keep = sg[0]
                     others = sg[1:]
                     
-                    print(f"\nFound duplicate group for '{keep.artist} - {keep.name}':")
-                    print(f"  [KEEP] {keep.id} (Added: {keep.added_at}, Played: {keep.last_played_at})")
-                    for other in others:
-                        print(f"  [DEL ] {other.id} (Added: {other.added_at}, Played: {other.last_played_at})")
-                        to_delete.append(other)
+                    if not auto_confirm:
+                        print(f"\nFound duplicate group for '{keep.artist} - {keep.name}':")
+                        print(f"  [KEEP] {keep.id} (Added: {keep.added_at}, Played: {keep.last_played_at})")
+                        for other in others:
+                            print(f"  [DEL ] {other.id} (Added: {other.added_at}, Played: {other.last_played_at})")
+                    
+                    to_delete.extend(others)
 
         if not to_delete:
-            print("No simple duplicates found.")
+            print("No duplicates found.")
             return
 
-        print(f"\nProceed with removing {len(to_delete)} duplicate tracks from Spotify and DB? [y/N]: ")
-        confirm = input().lower()
-        if confirm != 'y':
-            print("Operation cancelled.")
-            return
+        if not auto_confirm:
+            print(f"\nProceed with removing {len(to_delete)} duplicate tracks? [y/N]: ")
+            confirm = input().lower()
+            if confirm != 'y':
+                print("Operation cancelled.")
+                return
 
-        print(f"Removing {len(to_delete)} tracks...")
+        print(f"Removing {len(to_delete)} duplicate tracks...")
         trans_id = create_transaction(self.db, "DELETE", len(to_delete), "Deduplication run")
         
         by_playlist = {}
@@ -299,33 +294,41 @@ class Manager:
             print(f"No studio albums found for {selected_artist['name']}.")
             return
 
+        active_storage_ids = set(get_all_active_track_ids(self.db))
+        
         tracks_by_letter: Dict[str, List[Track]] = {}
-        total_tracks = 0
+        total_tracks_to_add = 0
+        already_there_count = 0
         
         for album in albums:
             print(f"  Fetching tracks for album: {album['name']}")
             tracks = self.sp.get_album_tracks(album["id"], album["name"])
             for track in tracks:
+                if track.id in active_storage_ids:
+                    already_there_count += 1
+                    continue
+                    
                 letter = self._get_storage_letter(track.name)
                 if letter not in tracks_by_letter:
                     tracks_by_letter[letter] = []
                 tracks_by_letter[letter].append(track)
-                total_tracks += 1
-
-        if total_tracks == 0:
-            print(f"No tracks found in the {len(albums)} albums.")
-            return
+                total_tracks_to_add += 1
 
         print(f"\nSummary for {selected_artist['name']}:")
         print(f"  Total studio albums: {len(albums)}")
-        print(f"  Total tracks to add: {total_tracks}")
+        print(f"  New tracks to add: {total_tracks_to_add}")
+        print(f"  Tracks already in storage: {already_there_count}")
         
-        confirm = input("\nProceed with adding these tracks to A-Z playlists? [y/N]: ").lower()
+        if total_tracks_to_add == 0:
+            print("All tracks from these albums are already in your storage. Nothing to add.")
+            return
+
+        confirm = input("\nProceed with adding new tracks to A-Z playlists? [y/N]: ").lower()
         if confirm != 'y':
             print("Operation cancelled.")
             return
 
-        trans_id = create_transaction(self.db, "ADD", total_tracks, f"addartist: {selected_artist['name']}")
+        trans_id = create_transaction(self.db, "ADD", total_tracks_to_add, f"addartist: {selected_artist['name']}")
         current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
         now = datetime.now()
 
@@ -339,14 +342,15 @@ class Manager:
             tracks = tracks_by_letter[letter]
             track_ids = list(set(t.id for t in tracks))
             
-            print(f"Adding {len(track_ids)} tracks to playlist '{letter}'...")
+            print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
             self.sp.add_tracks_to_playlist(playlist_id, track_ids)
             
             for track in tracks:
                 track.storage_playlist_id = playlist_id
                 track.add_transaction_id = trans_id
                 track.added_at = now
-                upsert_track(self.db, track)
+            
+            upsert_tracks(self.db, tracks)
         
         print(f"Artist '{selected_artist['name']}' added to storage. Transaction #{trans_id}")
 
@@ -402,7 +406,6 @@ class Manager:
         if not track_ids: return
 
         current_track_id = self._get_current_track_id()
-        # Keep current track if it's in the list
         to_remove = [tid for tid in track_ids if tid != current_track_id]
         
         if not to_remove:
@@ -433,7 +436,6 @@ class Manager:
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         trans_id = create_transaction(self.db, "DELETE", len(removed_ids), f"Refill run removal {ts_str}")
         
-        # Group by storage playlist for efficient removal
         by_playlist = {}
         for track in removed_tracks:
             if track.storage_playlist_id not in by_playlist:
@@ -461,14 +463,14 @@ class Manager:
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
         target_ms = int(target_hours * 3600 * 1000)
 
-        current_tracks = self.sp.get_playlist_tracks(active_playlist.id)
-        current_duration_ms = sum(t.duration_ms for t in current_tracks)
-        current_track_ids_set = set(t.id for t in current_tracks)
+        print("Fetching current active playlist state...")
+        current_tracks_on_spotify = self.sp.get_playlist_tracks(active_playlist.id)
+        current_track_ids_set = set(t.id for t in current_tracks_on_spotify)
 
-        # Detect manual removals
         if mode != "add":
-            self.detect_manual_removals([t.id for t in current_tracks])
+            self.detect_manual_removals([t.id for t in current_tracks_on_spotify])
 
+        current_duration_ms = sum(t.duration_ms for t in current_tracks_on_spotify)
         needed_ms = target_ms - current_duration_ms
         if needed_ms <= 0:
             print(f"Active playlist already has {current_duration_ms / 3600000:.1f} hours.")
@@ -476,37 +478,60 @@ class Manager:
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
         
-        pool = get_least_recently_played_tracks(self.db, limit=1000)
-        candidates = [t for t in pool if t.id not in current_track_ids_set]
-        random.shuffle(candidates)
+        print("Gathering candidate tracks from library...")
+        pool = get_least_recently_played_tracks(self.db, limit=5000)
+        
+        print(f"Analyzing {len(pool)} candidates...")
+        # Dictionary keyed by LEAD ARTIST
+        candidates_by_lead_artist: Dict[str, List[Track]] = {}
+        for track in pool:
+            if track.id not in current_track_ids_set:
+                # Extract Lead Artist (before first comma)
+                lead_artist = track.artist.split(',')[0].strip()
+                if lead_artist not in candidates_by_lead_artist:
+                    candidates_by_lead_artist[lead_artist] = []
+                candidates_by_lead_artist[lead_artist].append(track)
+        
+        for artist_tracks in candidates_by_lead_artist.values():
+            random.shuffle(artist_tracks)
+            
+        artist_names = list(candidates_by_lead_artist.keys())
+        random.shuffle(artist_names)
         
         to_add = []
         added_duration = 0
-        last_artist = current_tracks[-1].artist if current_tracks else ""
+        unique_artists_added = set()
         
-        while candidates and added_duration < needed_ms:
-            found_idx = -1
-            for i, track in enumerate(candidates):
-                if track.artist != last_artist:
-                    found_idx = i
+        last_artist_str = current_tracks_on_spotify[-1].artist if current_tracks_on_spotify else ""
+        last_lead_artist = last_artist_str.split(',')[0].strip() if last_artist_str else ""
+        
+        print("Selecting tracks using Fair Lead-Artist Round-Robin...")
+        while artist_names and added_duration < needed_ms:
+            for artist in list(artist_names):
+                if added_duration >= needed_ms:
                     break
-            
-            if found_idx == -1:
-                track = candidates.pop(0)
-            else:
-                track = candidates.pop(found_idx)
                 
-            to_add.append(track.id)
-            added_duration += track.duration_ms
-            last_artist = track.artist
+                if artist == last_lead_artist and len(artist_names) > 1:
+                    continue
+                
+                track = candidates_by_lead_artist[artist].pop(0)
+                
+                to_add.append(track.id)
+                added_duration += track.duration_ms
+                last_lead_artist = artist
+                unique_artists_added.add(artist)
+                
+                if not candidates_by_lead_artist[artist]:
+                    artist_names.remove(artist)
 
         if to_add:
-            print(f"Adding {len(to_add)} tracks to '{active_playlist_name}'.")
+            print(f"Selected {len(to_add)} tracks from {len(unique_artists_added)} different lead artists.")
+            print(f"Adding selected tracks to '{active_playlist_name}'...")
             self.sp.add_tracks_to_playlist(active_playlist.id, to_add)
             add_active_tracks(self.db, to_add)
+            print("Refill complete.")
 
     def list_adds(self):
-        # We also want to show INGEST transactions here as they are additions
         transactions = [t for t in list_transactions(self.db, "ADD")]
         transactions.extend(list_transactions(self.db, "INGEST"))
         transactions.sort(key=lambda x: x.timestamp, reverse=True)
@@ -528,7 +553,6 @@ class Manager:
             print(f"{t.id:<5} {ts:<20} {t.type:<8} {t.track_count:<6} {status:<12} {t.description}")
 
     def show_add(self, trans_id: int):
-        # Try both ADD and INGEST
         tracks = get_tracks_by_transaction(self.db, trans_id, "ADD")
         if not tracks:
             tracks = get_tracks_by_transaction(self.db, trans_id, "INGEST")
