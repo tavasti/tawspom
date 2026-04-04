@@ -66,14 +66,6 @@ class Manager:
         playlist_stats = []
 
         for pl in playlists:
-            # Skip if count matches (optimization for crashes)
-            if skip_synced:
-                db_count = get_playlist_track_count(self.db, pl.id)
-                # We can't know for sure without fetching, but if counts match, 
-                # we assume it's "mostly" fine for an initdb/sync run.
-                # For sync, we might want to be more thorough, but let's start here.
-                pass 
-
             print(f"  Reading {pl.name}...", end="\r")
             sys.stdout.flush()
             
@@ -87,7 +79,6 @@ class Manager:
                 "duration": pl_duration_ms
             })
             
-            # Bulk upsert for performance
             upsert_tracks(self.db, tracks)
             for t in tracks:
                 spotify_track_ids.add(t.id)
@@ -180,7 +171,6 @@ class Manager:
                 print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
                 self.sp.add_tracks_to_playlist(playlist_id, track_ids)
                 
-                # Set metadata for bulk insert
                 for track in tracks:
                     track.storage_playlist_id = playlist_id
                     track.add_transaction_id = trans_id
@@ -261,8 +251,8 @@ class Manager:
         mark_tracks_deleted(self.db, [t.id for t in to_delete], trans_id)
         print(f"Deduplication complete. Recorded DELETE transaction #{trans_id}")
 
-    def add_artist_to_storage(self, artist_name: str):
-        """Finds artist, studio albums, and adds all tracks to A-Z storage playlists."""
+    def add_artist_to_storage(self, artist_name: str, types: List[str] = ["album"]):
+        """Finds artist and interactively lets user select albums/singles to add."""
         artists = self.sp.search_artist(artist_name)
         if not artists:
             print(f"Artist '{artist_name}' not found.")
@@ -274,10 +264,7 @@ class Manager:
         else:
             print(f"\nMultiple artists found for '{artist_name}':")
             for idx, artist in enumerate(artists, 1):
-                genres = ", ".join(artist["genres"])
-                top_songs = artist["top_songs"]
-                print(f"  [{idx}] {artist['name']} (Pop: {artist['popularity']}, Genres: {genres})")
-                print(f"      Top Songs: {top_songs}")
+                print(f"  [{idx}] {artist['name']} (Pop: {artist['popularity']}, Genres: {', '.join(artist['genres'])})")
             
             try:
                 choice = int(input(f"\nSelect artist [1-{len(artists)}]: "))
@@ -287,21 +274,71 @@ class Manager:
                 return
 
         artist_id = selected_artist["id"]
-        print(f"\nFetching albums for {selected_artist['name']} (ID: {artist_id})...")
-        albums = self.sp.get_artist_albums(artist_id)
+        print(f"\nFetching releases for {selected_artist['name']}...")
+        all_releases = self.sp.get_artist_albums(artist_id, types=types)
         
-        if not albums:
-            print(f"No studio albums found for {selected_artist['name']}.")
+        if not all_releases:
+            print(f"No releases found matching criteria ({'/'.join(types)}).")
             return
 
+        selected_albums = []
+        remaining_albums = list(all_releases)
+
+        while True:
+            print(f"\n--- {selected_artist['name']} Releases ---")
+            for idx, album in enumerate(remaining_albums, 1):
+                year = album.get("release_date", "0000")[:4]
+                print(f"  [{idx:2}] ({year}) {album['name']}")
+            
+            print(f"\nSelected so far: {len(selected_albums)} releases.")
+            choice = input("\nAdd [a]ll / [s]ome / [n]one (or 'ok' to proceed): ").lower().strip()
+            
+            if choice == 'a':
+                selected_albums.extend(remaining_albums)
+                break
+            elif choice == 'n':
+                if not selected_albums:
+                    print("Operation cancelled.")
+                    return
+                break
+            elif choice == 'ok':
+                if not selected_albums:
+                    print("Nothing selected. Operation cancelled.")
+                    return
+                break
+            elif choice == 's':
+                print("Enter numbers separated by space, comma, or semicolon (e.g., '1, 3 5'):")
+                nums_str = input("> ")
+                # Split by space, comma, or semicolon
+                nums = re.split(r'[ ,;]+', nums_str)
+                picked_this_round = []
+                for n in nums:
+                    try:
+                        idx = int(n) - 1
+                        if 0 <= idx < len(remaining_albums):
+                            picked_this_round.append(remaining_albums[idx])
+                    except ValueError:
+                        continue
+                
+                # Move picked to selected
+                for album in picked_this_round:
+                    selected_albums.append(album)
+                    remaining_albums.remove(album)
+                
+                if not remaining_albums:
+                    print("All releases picked.")
+                    break
+            else:
+                print("Invalid choice.")
+
+        # Proceed with adding tracks from selected_albums
         active_storage_ids = set(get_all_active_track_ids(self.db))
-        
         tracks_by_letter: Dict[str, List[Track]] = {}
         total_tracks_to_add = 0
         already_there_count = 0
         
-        for album in albums:
-            print(f"  Fetching tracks for album: {album['name']}")
+        print("\nFetching tracks for selected releases...")
+        for album in selected_albums:
             tracks = self.sp.get_album_tracks(album["id"], album["name"])
             for track in tracks:
                 if track.id in active_storage_ids:
@@ -314,13 +351,13 @@ class Manager:
                 tracks_by_letter[letter].append(track)
                 total_tracks_to_add += 1
 
-        print(f"\nSummary for {selected_artist['name']}:")
-        print(f"  Total studio albums: {len(albums)}")
+        print(f"\nFinal Summary for {selected_artist['name']}:")
+        print(f"  Releases selected: {len(selected_albums)}")
         print(f"  New tracks to add: {total_tracks_to_add}")
         print(f"  Tracks already in storage: {already_there_count}")
         
         if total_tracks_to_add == 0:
-            print("All tracks from these albums are already in your storage. Nothing to add.")
+            print("All tracks are already in your storage. Nothing to add.")
             return
 
         confirm = input("\nProceed with adding new tracks to A-Z playlists? [y/N]: ").lower()
@@ -482,11 +519,9 @@ class Manager:
         pool = get_least_recently_played_tracks(self.db, limit=5000)
         
         print(f"Analyzing {len(pool)} candidates...")
-        # Dictionary keyed by LEAD ARTIST
         candidates_by_lead_artist: Dict[str, List[Track]] = {}
         for track in pool:
             if track.id not in current_track_ids_set:
-                # Extract Lead Artist (before first comma)
                 lead_artist = track.artist.split(',')[0].strip()
                 if lead_artist not in candidates_by_lead_artist:
                     candidates_by_lead_artist[lead_artist] = []

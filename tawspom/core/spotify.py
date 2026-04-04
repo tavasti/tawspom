@@ -41,7 +41,7 @@ class SpotifyClient:
                     raise
                 print(f"\nConnection error: {e}. Retrying in 2 seconds... (Attempt {i+1}/{max_retries})")
                 time.sleep(2)
-                self._init_sp() # Re-init client just in case it helps
+                self._init_sp()
         return None
 
     def get_storage_playlists(self) -> List[Playlist]:
@@ -83,25 +83,31 @@ class SpotifyClient:
             })
         return artists
 
-    def get_artist_albums(self, artist_id: str) -> List[dict]:
-        """Fetches studio albums, filtering out live and deluxe versions where possible."""
+    def get_artist_albums(self, artist_id: str, types: List[str] = ["album"]) -> List[dict]:
+        """Fetches albums/singles, including release date."""
         albums = []
         offset = 0
+        album_types = ",".join(types)
         while True:
-            result = self._call_with_retry(self.sp.artist_albums, artist_id, album_type="album", limit=50, offset=offset)
+            result = self._call_with_retry(self.sp.artist_albums, artist_id, album_type=album_types, limit=50, offset=offset)
             albums.extend(result["items"])
             if not result["next"]:
                 break
             offset += 50
         
         filtered = {}
+        # Keywords to avoid in standard collection unless specifically asked
         skip_keywords = ["live", "deluxe", "expanded", "bonus", "remaster", "edition", "super"]
+        
+        # Sort by release date descending
         albums.sort(key=lambda x: x.get("release_date", "0000"), reverse=True)
 
         for album in albums:
             name_lower = album["name"].lower()
-            if any(k in name_lower for k in skip_keywords):
+            # If it's a single, we are less aggressive with filtering
+            if album["album_type"] != "single" and any(k in name_lower for k in skip_keywords):
                 continue
+            
             if album["name"] not in filtered:
                 filtered[album["name"]] = album
         
@@ -194,10 +200,10 @@ class SpotifyClient:
         return tracks
 
     def remove_liked_songs(self, track_ids: List[str]):
-        """Removes tracks from 'Liked Songs'. Batches of 50."""
+        """Removes tracks from 'Liked Songs'. Using safe batch size of 20."""
         if not track_ids: return
-        for i in range(0, len(track_ids), 50):
-            self._call_with_retry(self.sp.current_user_saved_tracks_delete, tracks=track_ids[i:i+50])
+        for i in range(0, len(track_ids), 20):
+            self._call_with_retry(self.sp.current_user_saved_tracks_delete, tracks=track_ids[i:i+20])
 
     def get_active_playlist(self, name: str) -> Optional[Playlist]:
         """Finds or creates an 'Active' playlist by name."""

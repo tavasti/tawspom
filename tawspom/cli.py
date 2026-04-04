@@ -20,11 +20,16 @@ def main():
     subparsers.add_parser("ingest", help="Move all 'Liked Songs' to A-Z storage playlists")
 
     # Maintenance
-    subparsers.add_parser("deduplicate", help="Find and remove duplicate tracks (same artist/name/duration) from storage")
+    subparsers.add_parser("deduplicate", help="Find and remove duplicate tracks from storage")
 
     # Add Artist
-    add_artist_parser = subparsers.add_parser("addartist", help="Add all studio tracks of an artist to storage")
+    add_artist_parser = subparsers.add_parser("addartist", help="Add studio tracks of an artist to storage")
     add_artist_parser.add_argument("name", help="Name of the artist")
+    
+    artist_type_group = add_artist_parser.add_mutually_exclusive_group()
+    artist_type_group.add_argument("--album", action="store_true", default=True, help="Fetch albums only (default)")
+    artist_type_group.add_argument("--single", action="store_true", help="Fetch singles only")
+    artist_type_group.add_argument("--all", action="store_true", help="Fetch both albums and singles")
 
     # Transaction Management
     subparsers.add_parser("listadd", help="List all addition (ADD/INGEST) transactions")
@@ -76,7 +81,12 @@ def main():
     elif args.command == "deduplicate":
         manager.deduplicate_storage()
     elif args.command == "addartist":
-        manager.add_artist_to_storage(args.name)
+        types = ["album"]
+        if args.single:
+            types = ["single"]
+        elif args.all:
+            types = ["album", "single"]
+        manager.add_artist_to_storage(args.name, types=types)
     elif args.command == "listadd":
         manager.list_adds()
     elif args.command == "listdelete":
