@@ -265,6 +265,7 @@ class Manager:
             print(f"\nMultiple artists found for '{artist_name}':")
             for idx, artist in enumerate(artists, 1):
                 print(f"  [{idx}] {artist['name']} (Pop: {artist['popularity']}, Genres: {', '.join(artist['genres'])})")
+                print(f"      Top Songs: {artist['top_songs']}")
             
             try:
                 choice = int(input(f"\nSelect artist [1-{len(artists)}]: "))
@@ -281,57 +282,69 @@ class Manager:
             print(f"No releases found matching criteria ({'/'.join(types)}).")
             return
 
-        selected_albums = []
-        remaining_albums = list(all_releases)
+        selected_indices = set()
 
         while True:
             print(f"\n--- {selected_artist['name']} Releases ---")
-            for idx, album in enumerate(remaining_albums, 1):
+            for idx, album in enumerate(all_releases, 1):
                 year = album.get("release_date", "0000")[:4]
-                print(f"  [{idx:2}] ({year}) {album['name']}")
+                status = "[X]" if (idx-1) in selected_indices else "[ ]"
+                print(f"  {status} [{idx:2}] ({year}) {album['name']}")
             
-            print(f"\nSelected so far: {len(selected_albums)} releases.")
-            choice = input("\nAdd [a]ll / [s]ome / [n]one (or 'ok' to proceed): ").lower().strip()
+            print(f"\nSelected: {len(selected_indices)} releases.")
+            print("Add [a]ll / [s]ome / [n]one / [c]ancel / [ok] to proceed")
+            choice = input("> ").lower().strip()
             
             if choice == 'a':
-                selected_albums.extend(remaining_albums)
+                selected_indices = set(range(len(all_releases)))
+                # Auto-proceed for 'all' as requested
                 break
             elif choice == 'n':
-                if not selected_albums:
-                    print("Operation cancelled.")
-                    return
-                break
+                selected_indices = set()
+                print("Selection cleared.")
+            elif choice == 'c':
+                print("Operation cancelled.")
+                return
             elif choice == 'ok':
-                if not selected_albums:
-                    print("Nothing selected. Operation cancelled.")
-                    return
+                if not selected_indices:
+                    print("Nothing selected. Use 'c' to cancel or select some releases first.")
+                    continue
                 break
-            elif choice == 's':
-                print("Enter numbers separated by space, comma, or semicolon (e.g., '1, 3 5'):")
-                nums_str = input("> ")
-                # Split by space, comma, or semicolon
+            elif choice == 's' or choice.isdigit() or choice == 'all' or any(c in choice for c in ', ;'):
+                # Handle 'all' inside the selection loop
+                if choice == 'all':
+                    selected_indices = set(range(len(all_releases)))
+                    continue
+
+                if choice == 's':
+                    print("Enter numbers to toggle (or 'all' to select all, 'ok' to proceed):")
+                    nums_str = input(">> ").lower().strip()
+                else:
+                    nums_str = choice
+                
+                if nums_str == 'all':
+                    selected_indices = set(range(len(all_releases)))
+                    continue
+                elif nums_str == 'ok':
+                    break
+
                 nums = re.split(r'[ ,;]+', nums_str)
-                picked_this_round = []
                 for n in nums:
                     try:
-                        idx = int(n) - 1
-                        if 0 <= idx < len(remaining_albums):
-                            picked_this_round.append(remaining_albums[idx])
+                        val = int(n)
+                        idx = val - 1
+                        if 0 <= idx < len(all_releases):
+                            if idx in selected_indices:
+                                selected_indices.remove(idx)
+                            else:
+                                selected_indices.add(idx)
                     except ValueError:
                         continue
-                
-                # Move picked to selected
-                for album in picked_this_round:
-                    selected_albums.append(album)
-                    remaining_albums.remove(album)
-                
-                if not remaining_albums:
-                    print("All releases picked.")
-                    break
             else:
                 print("Invalid choice.")
 
-        # Proceed with adding tracks from selected_albums
+        selected_albums = [all_releases[i] for i in sorted(list(selected_indices))]
+
         active_storage_ids = set(get_all_active_track_ids(self.db))
         tracks_by_letter: Dict[str, List[Track]] = {}
         total_tracks_to_add = 0
@@ -402,27 +415,29 @@ class Manager:
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
         if not active_playlist: return False
 
+        track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
+        if not track_ids:
+            return True
+
         playback = self.sp.get_current_playback()
         if not playback or not playback.get("item"):
-            print("Error: Nothing is currently playing.")
+            print("Error: Nothing is currently playing. Start playing 'My Active Music' first, or use --flush.")
             return False
 
         current_track_id = playback["item"]["id"]
         context = playback.get("context")
         if not context or context.get("type") != "playlist" or active_playlist.id not in context.get("uri", ""):
-            print(f"Error: Currently playing from a different source (not {active_playlist_name}).")
+            print(f"Error: Currently playing from a different source. To switch to '{active_playlist_name}', start playing it first, or use --flush.")
             return False
 
-        track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
         try:
             current_index = track_ids.index(current_track_id)
         except ValueError:
-            print("Error: Currently playing track not found in the active playlist.")
+            print(f"Error: Currently playing track not found in '{active_playlist_name}'. Use --flush if you want to reset it.")
             return False
 
         listened_ids = track_ids[:current_index]
         if not listened_ids:
-            print("No new tracks have been listened to yet.")
             return True
 
         print(f"Marking {len(listened_ids)} tracks as played.")
