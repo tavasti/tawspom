@@ -12,7 +12,6 @@ class SpotifyClient:
         cache_path = os.path.expanduser(f"~/.tawspom/token_{user_label}.json")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         
-        # Added user-library-modify to ensure we can remove liked songs
         self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
             scope=scope or "user-library-read user-library-modify user-read-playback-state playlist-read-private playlist-modify-private playlist-modify-public",
             client_id=os.getenv("SPOTIPY_CLIENT_ID"),
@@ -32,7 +31,6 @@ class SpotifyClient:
             response = self.sp.current_user_playlists(limit=limit, offset=offset)
             items = response.get("items", [])
             for item in items:
-                # Based on user input: A-Z playlists
                 if len(item["name"]) == 1 and item["name"].isalpha():
                     playlists.append(Playlist(item["id"], item["name"]))
             
@@ -49,7 +47,6 @@ class SpotifyClient:
         
         artists = []
         for item in items:
-            # Get top tracks to help with identification
             top_tracks_res = self.sp.artist_top_tracks(item["id"])
             top_tracks = top_tracks_res.get("tracks", [])[:3]
             top_songs_summary = ", ".join([t["name"][:20] for t in top_tracks])
@@ -68,30 +65,20 @@ class SpotifyClient:
         albums = []
         offset = 0
         while True:
-            # album_type='album' usually excludes singles and compilations
             result = self.sp.artist_albums(artist_id, album_type="album", limit=50, offset=offset)
             albums.extend(result["items"])
             if not result["next"]:
                 break
             offset += 50
         
-        # Filtering logic:
-        # 1. Sort by release date descending
-        # 2. Skip "live", "deluxe", "expanded", "bonus", "remaster"
-        # 3. Take the first (newest) version of each album name
         filtered = {}
-        # Keywords to avoid in studio album collection
         skip_keywords = ["live", "deluxe", "expanded", "bonus", "remaster", "edition", "super"]
-        
-        # Sort by date (newest first)
         albums.sort(key=lambda x: x.get("release_date", "0000"), reverse=True)
 
         for album in albums:
             name_lower = album["name"].lower()
             if any(k in name_lower for k in skip_keywords):
                 continue
-            
-            # Use name as key to only keep one version (the newest, since we sorted)
             if album["name"] not in filtered:
                 filtered[album["name"]] = album
         
@@ -118,7 +105,7 @@ class SpotifyClient:
                     artist=artist_names,
                     album=album_name,
                     duration_ms=t["duration_ms"],
-                    storage_playlist_id="" # Will be determined by manager
+                    storage_playlist_id="" 
                 ))
             if not result["next"]:
                 break
@@ -173,7 +160,7 @@ class SpotifyClient:
                         artist=artist_names,
                         album=album_name,
                         duration_ms=t["duration_ms"],
-                        storage_playlist_id="LIKED" # Temporary marker
+                        storage_playlist_id="LIKED"
                     ))
             if len(items) < limit:
                 break
@@ -181,10 +168,11 @@ class SpotifyClient:
         return tracks
 
     def remove_liked_songs(self, track_ids: List[str]):
-        """Removes tracks from 'Liked Songs'."""
+        """Removes tracks from 'Liked Songs'. Batches of 50."""
         if not track_ids: return
-        for i in range(0, len(track_ids), 50): # limit is 50
-            self.sp.current_user_saved_tracks_delete(track_ids[i:i+50])
+        for i in range(0, len(track_ids), 50):
+            # spotipy's current_user_saved_tracks_delete takes a list of IDs
+            self.sp.current_user_saved_tracks_delete(tracks=track_ids[i:i+50])
 
     def get_active_playlist(self, name: str) -> Optional[Playlist]:
         """Finds or creates an 'Active' playlist by name."""
@@ -200,7 +188,6 @@ class SpotifyClient:
                 break
             offset += limit
         
-        # Create it if it doesn't exist
         user_id = self.sp.current_user()["id"]
         new_pl = self.sp.user_playlist_create(user_id, name, public=False)
         return Playlist(new_pl["id"], new_pl["name"], is_active=True)
@@ -213,7 +200,6 @@ class SpotifyClient:
         """Removes a list of tracks from a playlist."""
         if not track_ids:
             return
-        # Spotify allows removing up to 100 tracks at a time
         for i in range(0, len(track_ids), 100):
             self.sp.playlist_remove_all_occurrences_of_items(playlist_id, track_ids[i:i+100])
 
@@ -221,7 +207,6 @@ class SpotifyClient:
         """Adds a list of tracks to a playlist."""
         if not track_ids:
             return
-        # Spotify allows adding up to 100 tracks at a time
         for i in range(0, len(track_ids), 100):
             self.sp.playlist_add_items(playlist_id, track_ids[i:i+100])
 

@@ -207,6 +207,26 @@ def get_tracks_by_ids(conn, track_ids: List[str]) -> List[Track]:
         ))
     return tracks
 
+def get_all_active_tracks(conn) -> List[Track]:
+    """Returns all non-deleted tracks."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id
+        FROM track WHERE is_deleted = 0
+    """)
+    tracks = []
+    for row in cur.fetchall():
+        tracks.append(Track(
+            id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
+            last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
+            added_at=datetime.fromisoformat(row[7]) if row[7] else None,
+            deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
+            is_deleted=bool(row[9]),
+            add_transaction_id=row[10],
+            delete_transaction_id=row[11]
+        ))
+    return tracks
+
 def get_all_active_track_ids(conn) -> List[str]:
     cur = conn.cursor()
     cur.execute("SELECT id FROM track WHERE is_deleted = 0")

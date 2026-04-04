@@ -19,6 +19,9 @@ def main():
     # Ingestion
     subparsers.add_parser("ingest", help="Move all 'Liked Songs' to A-Z storage playlists")
 
+    # Maintenance
+    subparsers.add_parser("deduplicate", help="Find and remove duplicate tracks (same artist/name/duration) from storage")
+
     # Add Artist
     add_artist_parser = subparsers.add_parser("addartist", help="Add all studio tracks of an artist to storage")
     add_artist_parser.add_argument("name", help="Name of the artist")
@@ -70,6 +73,8 @@ def main():
         manager.whoami()
     elif args.command == "ingest":
         manager.ingest_liked_songs()
+    elif args.command == "deduplicate":
+        manager.deduplicate_storage()
     elif args.command == "addartist":
         manager.add_artist_to_storage(args.name)
     elif args.command == "listadd":

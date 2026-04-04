@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime
 import re
 import sys
@@ -6,12 +6,13 @@ import unicodedata
 import random
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.db import (
+    init_db as db_init_db,
     upsert_track, mark_as_played, get_least_recently_played_tracks,
     create_transaction, mark_tracks_deleted, unmark_tracks_deleted,
     get_all_active_track_ids, list_transactions, get_tracks_by_transaction,
     get_transaction, delete_tracks_permanently, set_transaction_cancelled_status,
     add_active_tracks, remove_active_tracks, get_tracked_active_ids,
-    get_tracks_by_ids
+    get_tracks_by_ids, get_all_active_tracks
 )
 from tawspom.models import Track, Playlist, Transaction
 
@@ -48,28 +49,24 @@ class Manager:
             return f"{minutes:02}:{seconds:02}"
 
     def init_db(self):
-        """Alias for sync_storage - populates database from A-Z playlists."""
-        print("Initializing database from A-Z playlists...")
-        self.sync_storage()
+        """Initializes the database schema and populates it from A-Z playlists.
+        Does NOT ingest or detect removals."""
+        print("Initializing local database schema...")
+        db_init_db()
+        
+        print("\nPopulating database from Spotify A-Z playlists...")
+        spotify_ids, stats = self._fetch_all_storage_tracks()
+        
+        total_songs = sum(s['count'] for s in stats)
+        print(f"\nDatabase initialized and populated with {total_songs} tracks.")
 
-    def sync_storage(self):
-        """Main sync loop: 
-        1. Ingest new Liked Songs into storage.
-        2. Detect manual removals from storage.
-        3. Print summary of current storage.
+    def _fetch_all_storage_tracks(self) -> Tuple[Set[str], List[dict]]:
+        """Internal helper to read all tracks from A-Z playlists and upsert to DB.
+        Returns a set of all seen Spotify IDs and a list of per-playlist stats.
         """
-        # Step 1: Ingest new likes
-        self.ingest_liked_songs()
-
-        # Step 2 & 3: Fetch everything first to detect removals, then report
-        print("\nFetching current storage state from Spotify...")
         playlists = self.sp.get_storage_playlists()
         spotify_track_ids = set()
-        
-        # We store stats to print the table later
         playlist_stats = []
-        total_songs = 0
-        total_duration_ms = 0
 
         for pl in playlists:
             print(f"  Reading {pl.name}...", end="\r")
@@ -85,17 +82,29 @@ class Manager:
                 "duration": pl_duration_ms
             })
             
-            total_songs += pl_count
-            total_duration_ms += pl_duration_ms
-            
             for track in tracks:
                 track.storage_playlist_id = pl.id
                 upsert_track(self.db, track)
                 spotify_track_ids.add(track.id)
         
         print(f"  Finished reading {len(playlists)} playlists.        ")
+        return spotify_track_ids, playlist_stats
 
-        # Now detect removals BEFORE showing the final table
+    def sync_storage(self):
+        """Main sync loop: 
+        1. Ingest new Liked Songs into storage.
+        2. Fetch A-Z playlists and update DB.
+        3. Detect manual removals from storage.
+        4. Report summary.
+        """
+        # Step 1: Ingest new likes
+        self.ingest_liked_songs()
+
+        # Step 2: Fetch storage
+        print("\nFetching current storage state from Spotify...")
+        spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
+
+        # Step 3: Detect manual removals
         db_track_ids = set(get_all_active_track_ids(self.db))
         missing_ids = list(db_track_ids - spotify_track_ids)
         
@@ -108,60 +117,154 @@ class Manager:
             mark_tracks_deleted(self.db, missing_ids, trans_id)
             print(f"Recorded DELETE transaction #{trans_id}\n")
 
-        # Finally, print the summary table
+        # Step 4: Report
+        total_songs = 0
+        total_duration_ms = 0
         print(f"{'Playlist':<10} {'Songs':<8} {'Duration':<12}")
         print("-" * 30)
         for stat in sorted(playlist_stats, key=lambda x: x["name"]):
             print(f"{stat['name']:<10} {stat['count']:<8} {self._format_duration(stat['duration']):<12}")
+            total_songs += stat['count']
+            total_duration_ms += stat['duration']
         
         print("-" * 30)
         print(f"{'TOTAL':<10} {total_songs:<8} {self._format_duration(total_duration_ms):<12}")
         print("\nStorage synced successfully.")
 
     def ingest_liked_songs(self):
-        """Moves all tracks from 'Liked Songs' to storage playlists."""
+        """Moves tracks from 'Liked Songs' to storage playlists, avoiding duplicates."""
         print("Checking 'Liked Songs' for new tracks...")
         liked_tracks = self.sp.get_liked_songs()
         if not liked_tracks:
             print("No new liked songs to ingest.")
             return
 
-        print(f"Found {len(liked_tracks)} songs to ingest.")
+        # Get current storage IDs from DB to avoid duplicates
+        active_storage_ids = set(get_all_active_track_ids(self.db))
         
-        # Determine destinations
-        tracks_by_letter: Dict[str, List[Track]] = {}
+        to_move = []
+        already_there_count = 0
         for track in liked_tracks:
-            letter = self._get_storage_letter(track.name)
-            if letter not in tracks_by_letter:
-                tracks_by_letter[letter] = []
-            tracks_by_letter[letter].append(track)
-            
-        trans_id = create_transaction(self.db, "INGEST", len(liked_tracks), f"Ingest from Liked Songs")
-        current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
-        now = datetime.now()
+            if track.id in active_storage_ids:
+                already_there_count += 1
+            else:
+                to_move.append(track)
 
-        for letter in sorted(tracks_by_letter.keys()):
-            playlist_id = current_playlists.get(letter)
-            if not playlist_id:
-                print(f"Creating storage playlist '{letter}'...")
-                new_pl = self.sp.create_playlist(letter)
-                playlist_id = new_pl.id
-            
-            tracks = tracks_by_letter[letter]
-            track_ids = [t.id for t in tracks]
-            
-            print(f"Moving {len(track_ids)} tracks to playlist '{letter}'...")
-            self.sp.add_tracks_to_playlist(playlist_id, track_ids)
-            
-            for track in tracks:
-                track.storage_playlist_id = playlist_id
-                track.add_transaction_id = trans_id
-                track.added_at = now
-                upsert_track(self.db, track)
+        if already_there_count > 0:
+            print(f"Note: {already_there_count} tracks were already in storage. They will only be removed from 'Liked Songs'.")
 
-        print("Removing ingested tracks from Spotify 'Liked Songs'...")
+        if not to_move:
+            print("No new tracks to add to A-Z playlists.")
+        else:
+            print(f"Moving {len(to_move)} new songs to A-Z storage...")
+            # Determine destinations
+            tracks_by_letter: Dict[str, List[Track]] = {}
+            for track in to_move:
+                letter = self._get_storage_letter(track.name)
+                if letter not in tracks_by_letter:
+                    tracks_by_letter[letter] = []
+                tracks_by_letter[letter].append(track)
+                
+            trans_id = create_transaction(self.db, "INGEST", len(to_move), f"Ingest from Liked Songs")
+            current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
+            now = datetime.now()
+
+            for letter in sorted(tracks_by_letter.keys()):
+                playlist_id = current_playlists.get(letter)
+                if not playlist_id:
+                    print(f"Creating storage playlist '{letter}'...")
+                    new_pl = self.sp.create_playlist(letter)
+                    playlist_id = new_pl.id
+                
+                tracks = tracks_by_letter[letter]
+                track_ids = [t.id for t in tracks]
+                
+                print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
+                self.sp.add_tracks_to_playlist(playlist_id, track_ids)
+                
+                for track in tracks:
+                    track.storage_playlist_id = playlist_id
+                    track.add_transaction_id = trans_id
+                    track.added_at = now
+                    upsert_track(self.db, track)
+            print(f"New tracks recorded in DB (Transaction #{trans_id})")
+
+        print(f"Cleaning up 'Liked Songs' ({len(liked_tracks)} tracks)...")
         self.sp.remove_liked_songs([t.id for t in liked_tracks])
-        print(f"Ingest complete. Transaction #{trans_id}")
+        print("Ingest complete.")
+
+    def deduplicate_storage(self):
+        """Identifies and removes duplicate tracks (same artist/name/duration)."""
+        print("Searching for duplicates in local database...")
+        all_tracks = get_all_active_tracks(self.db)
+        
+        # Group by (Artist, Name) - case insensitive
+        groups: Dict[Tuple[str, str], List[Track]] = {}
+        for track in all_tracks:
+            key = (track.artist.lower(), track.name.lower())
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(track)
+            
+        duplicate_groups = [g for g in groups.values() if len(g) > 1]
+        
+        to_delete = []
+        for group in duplicate_groups:
+            # Further refine by duration (within 2 seconds)
+            # We sort by duration to easily find close ones
+            group.sort(key=lambda x: x.duration_ms)
+            
+            subgroups: List[List[Track]] = []
+            if group:
+                current_subgroup = [group[0]]
+                for i in range(1, len(group)):
+                    if abs(group[i].duration_ms - group[i-1].duration_ms) <= 2000:
+                        current_subgroup.append(group[i])
+                    else:
+                        subgroups.append(current_subgroup)
+                        current_subgroup = [group[i]]
+                subgroups.append(current_subgroup)
+                
+            for sg in subgroups:
+                if len(sg) > 1:
+                    # We have actual duplicates!
+                    # Logic to pick the one to KEEP:
+                    # 1. Prefer the one with a last_played_at
+                    # 2. Prefer the one added first
+                    sg.sort(key=lambda x: (x.last_played_at is None, x.added_at or datetime.max))
+                    keep = sg[0]
+                    others = sg[1:]
+                    
+                    print(f"\nFound duplicate group for '{keep.artist} - {keep.name}':")
+                    print(f"  [KEEP] {keep.id} (Added: {keep.added_at}, Played: {keep.last_played_at})")
+                    for other in others:
+                        print(f"  [DEL ] {other.id} (Added: {other.added_at}, Played: {other.last_played_at})")
+                        to_delete.append(other)
+
+        if not to_delete:
+            print("No simple duplicates found.")
+            return
+
+        print(f"\nProceed with removing {len(to_delete)} duplicate tracks from Spotify and DB? [y/N]: ")
+        confirm = input().lower()
+        if confirm != 'y':
+            print("Operation cancelled.")
+            return
+
+        print(f"Removing {len(to_delete)} tracks...")
+        trans_id = create_transaction(self.db, "DELETE", len(to_delete), "Deduplication run")
+        
+        by_playlist = {}
+        for track in to_delete:
+            if track.storage_playlist_id not in by_playlist:
+                by_playlist[track.storage_playlist_id] = []
+            by_playlist[track.storage_playlist_id].append(track.id)
+            
+        for pl_id, tids in by_playlist.items():
+            self.sp.remove_tracks_from_playlist(pl_id, tids)
+            
+        mark_tracks_deleted(self.db, [t.id for t in to_delete], trans_id)
+        print(f"Deduplication complete. Recorded DELETE transaction #{trans_id}")
 
     def add_artist_to_storage(self, artist_name: str):
         """Finds artist, studio albums, and adds all tracks to A-Z storage playlists."""
