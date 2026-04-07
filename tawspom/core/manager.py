@@ -537,7 +537,7 @@ class Manager:
                 playlist_id = new_pl.id
             
             tracks = tracks_by_letter[letter]
-            track_ids = list(set(t.id for t in tracks))
+            track_ids = [t.id for t in tracks]
             
             print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
             self.sp.add_tracks_to_playlist(playlist_id, track_ids)
@@ -785,7 +785,7 @@ class Manager:
 
         playback = self.sp.get_current_playback()
         if not playback or not playback.get("item"):
-            print("Error: Nothing is currently playing. Start playing 'My Active Music' first, or use --flush.")
+            print(f"Error: Nothing is currently playing. Start playing '{active_playlist_name}' first, or use --flush.")
             return []
 
         current_track_id = playback["item"]["id"]
@@ -867,7 +867,7 @@ class Manager:
         remove_active_tracks(self.db, removed_ids)
         print(f"Manual removals processed. Transaction #{trans_id}")
 
-    def refill_active_playlist(self, active_playlist_name: str, target_hours: float, mode: str = "default"):
+    def refill_active_playlist(self, active_playlist_name: str, target_hours: float, mode: str = "default", phone_playlist_name: str = "Phone Listening"):
         listened_ids = []
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
         
@@ -886,7 +886,7 @@ class Manager:
 
         # Handle 'Phone Listening' history
         if listened_ids:
-            self._update_phone_listening(listened_ids)
+            self._update_phone_listening(listened_ids, phone_playlist_name)
 
         target_ms = int(target_hours * 3600 * 1000)
 
@@ -956,12 +956,12 @@ class Manager:
             add_active_tracks(self.db, to_add)
             print("Refill complete.")
 
-    def _update_phone_listening(self, track_ids: List[str]):
-        """Adds tracks to 'Phone Listening' if it's shorter than 100 hours."""
-        pl = self.sp.get_active_playlist("Phone Listening")
+    def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
+        """Adds tracks to the specified phone history playlist if it's shorter than 100 hours."""
+        pl = self.sp.get_active_playlist(phone_playlist_name)
         
         # Check current duration
-        print("Checking 'Phone Listening' capacity...")
+        print(f"Checking '{phone_playlist_name}' capacity...")
         current_tracks = self.sp.get_playlist_tracks(pl.id)
         current_ms = sum(t.duration_ms for t in current_tracks)
         
@@ -970,7 +970,7 @@ class Manager:
             print(f"  Adding {len(track_ids)} tracks to history...")
             self.sp.add_tracks_to_playlist(pl.id, track_ids)
         else:
-            print("  'Phone Listening' is full (>= 100 hours). Skipping history update.")
+            print(f"  '{phone_playlist_name}' is full (>= 100 hours). Skipping history update.")
 
     def list_adds(self):
         transactions = [t for t in list_transactions(self.db, "ADD")]

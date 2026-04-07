@@ -1,10 +1,13 @@
 import argparse
 import sys
+import os
 from tawspom.core.db import init_db
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.manager import Manager
 
-ACTIVE_PLAYLIST_NAME = "My Active Music"
+# Configurable playlist names with defaults
+ACTIVE_PLAYLIST_NAME = os.getenv("ACTIVE_PLAYLIST_NAME", "My Active Music")
+PHONE_PLAYLIST_NAME = os.getenv("PHONE_PLAYLIST_NAME", "Phone Listening")
 
 def main():
     parser = argparse.ArgumentParser(description="Tawspom: Spotify Playlist Manager")
@@ -31,7 +34,7 @@ def main():
     radio_parser.add_argument("--main-count", type=int, default=10, help="Number of songs from the main artist (default: 10)")
     radio_parser.add_argument("--per-artist", type=int, default=5, help="Number of songs to take from EACH discovered related artist (default: 5)")
     radio_parser.add_argument("--filter", choices=["big", "small", "both"], default="both", 
-                              help="Filter related artists by size (big = top 50%%, small = bottom 50%%, both = all)")
+                              help="Filter related artists by size (big = top 50%, small = bottom 50%, both = all)")
 
     # Add Artist
     add_artist_parser = subparsers.add_parser("addartist", help="Add studio tracks of an artist to storage")
@@ -126,7 +129,7 @@ def main():
             mode = "flush"
         elif args.add:
             mode = "add"
-        manager.refill_active_playlist(ACTIVE_PLAYLIST_NAME, args.hours, mode=mode)
+        manager.refill_active_playlist(ACTIVE_PLAYLIST_NAME, args.hours, mode=mode, phone_playlist_name=PHONE_PLAYLIST_NAME)
 
 if __name__ == "__main__":
     main()
