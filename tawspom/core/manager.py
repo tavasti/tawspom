@@ -1,10 +1,14 @@
 from typing import List, Optional, Dict, Set, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import sys
 import unicodedata
 import random
+import difflib
+from spotipy.exceptions import SpotifyException
 from tawspom.core.spotify import SpotifyClient
+from tawspom.core.lastfm import LastFMClient
+from tawspom.core.scraper import SpotifyScraper
 from tawspom.core.db import (
     init_db as db_init_db,
     upsert_track, upsert_tracks, mark_as_played, get_least_recently_played_tracks,
@@ -12,7 +16,10 @@ from tawspom.core.db import (
     get_all_active_track_ids, list_transactions, get_tracks_by_transaction,
     get_transaction, delete_tracks_permanently, set_transaction_cancelled_status,
     add_active_tracks, remove_active_tracks, get_tracked_active_ids,
-    get_tracks_by_ids, get_all_active_tracks, get_playlist_track_count
+    get_tracks_by_ids, get_all_active_tracks, get_playlist_track_count,
+    add_to_duplicate_allowlist, is_duplicate_allowed, save_review_session,
+    get_review_session, clear_review_session,
+    get_artist_last_check, set_artist_checked, get_handled_albums, add_to_ignored_albums
 )
 from tawspom.models import Track, Playlist, Transaction
 
@@ -20,6 +27,8 @@ class Manager:
     def __init__(self, sp_client: SpotifyClient, db_conn):
         self.sp = sp_client
         self.db = db_conn
+        self.lfm = LastFMClient()
+        self.scraper = SpotifyScraper()
 
     def _get_storage_letter(self, name: str) -> str:
         """Maps a track name to a single A-Z letter, handling accents and special characters."""
@@ -88,13 +97,9 @@ class Manager:
 
     def sync_storage(self):
         """Main sync loop."""
-        # Step 1: Ingest new likes
         self.ingest_liked_songs()
-
-        # Step 2: Deduplicate (Internal, auto-confirm)
         self.deduplicate_storage(auto_confirm=True)
 
-        # Step 3: Fetch storage and detect manual removals
         print("\nSyncing storage state...")
         spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
 
@@ -110,7 +115,6 @@ class Manager:
             mark_tracks_deleted(self.db, missing_ids, trans_id)
             print(f"Recorded DELETE transaction #{trans_id}\n")
 
-        # Step 4: Report
         total_songs = 0
         total_duration_ms = 0
         print(f"{'Playlist':<10} {'Songs':<8} {'Duration':<12}")
@@ -226,7 +230,7 @@ class Manager:
                     to_delete.extend(others)
 
         if not to_delete:
-            print("No duplicates found.")
+            print("No binary duplicates found.")
             return
 
         if not auto_confirm:
@@ -251,6 +255,153 @@ class Manager:
         mark_tracks_deleted(self.db, [t.id for t in to_delete], trans_id)
         print(f"Deduplication complete. Recorded DELETE transaction #{trans_id}")
 
+    def _get_root_name(self, name: str) -> str:
+        """Strips common version/remix/feat suffixes to find the 'root' song name."""
+        name = re.sub(r'\s*[\[\(](remaster|edit|remix|mix|radio|live|feat|acoustic|version|original|mono|stereo|bonus|20\d\d|single|video).*?[\]\)]', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\s*-\s*(remix|radio|edit|acoustic|mix|version|feat|original).*$', '', name, flags=re.IGNORECASE)
+        return name.strip().lower()
+
+    def find_version_duplicates(self):
+        """Identifies potential semantic duplicates and puts them in 'Duplicate Review' playlist."""
+        print("Searching for different versions of the same songs...")
+        all_tracks = get_all_active_tracks(self.db)
+        
+        groups: Dict[Tuple[str, str], List[Track]] = {}
+        for track in all_tracks:
+            lead_artist = track.artist.split(',')[0].strip().lower()
+            root_name = self._get_root_name(track.name)
+            if not root_name: continue
+            
+            key = (lead_artist, root_name)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(track)
+            
+        potential_groups = {}
+        for key, tracks in groups.items():
+            if len(tracks) < 2: continue
+            
+            filtered_tracks = []
+            for i in range(len(tracks)):
+                is_new = True
+                for j in range(len(tracks)):
+                    if i == j: continue
+                    if is_duplicate_allowed(self.db, tracks[i].id, tracks[j].id):
+                        is_new = False
+                        break
+                if is_new:
+                    filtered_tracks.append(tracks[i])
+            
+            if len(filtered_tracks) > 1:
+                potential_groups[key] = filtered_tracks
+
+        if not potential_groups:
+            print("No potential versions found to review.")
+            return
+
+        review_keys = list(potential_groups.keys())[:20]
+        tracks_to_review = []
+        session_data = []
+        
+        print(f"\nPreparing review session for {len(review_keys)} song groups...")
+        for key in review_keys:
+            tracks = potential_groups[key]
+            for t in tracks:
+                tracks_to_review.append(t.id)
+                session_data.append((t.id, f"{key[0]}|{key[1]}"))
+
+        review_pl = self.sp.get_active_playlist("Duplicate Review")
+        print(f"Clearing and populating '{review_pl.name}'...")
+        existing_ids = self.sp.get_playlist_tracks_ordered(review_pl.id)
+        self.sp.remove_tracks_from_playlist(review_pl.id, existing_ids)
+        self.sp.add_tracks_to_playlist(review_pl.id, tracks_to_review)
+        
+        save_review_session(self.db, session_data)
+        
+        print("\nReview session ready!")
+        print("1. Open Spotify and listen to the 'Duplicate Review' playlist.")
+        print("2. DELETE any tracks you don't want to keep.")
+        print("3. LEAVE the tracks you want to keep.")
+        print("4. When done, run: python main.py processversions")
+
+    def process_version_review(self):
+        """Finalizes the review session: deletes missing tracks, allows remaining ones."""
+        session_groups = get_review_session(self.db)
+        if not session_groups:
+            print("No active review session found. Run 'findversions' first.")
+            return
+
+        review_pl = self.sp.get_active_playlist("Duplicate Review")
+        current_ids = set(self.sp.get_playlist_tracks_ordered(review_pl.id))
+        
+        tracks_to_delete = []
+        kept_duplicate_groups = []
+        restored_groups = []
+        
+        print("Processing your review...")
+        for key, expected_ids in session_groups.items():
+            kept_in_group = [tid for tid in expected_ids if tid in current_ids]
+            removed_in_group = [tid for tid in expected_ids if tid not in current_ids]
+            
+            if not kept_in_group:
+                # All removed - restore to review as per request
+                restored_groups.append(expected_ids)
+            else:
+                if removed_in_group:
+                    tracks_to_delete.extend(removed_in_group)
+                
+                if len(kept_in_group) > 1:
+                    kept_duplicate_groups.append(kept_in_group)
+
+        if restored_groups:
+            print(f"\nWarning: You removed ALL versions for {len(restored_groups)} songs.")
+            for group in restored_groups:
+                tracks = get_tracks_by_ids(self.db, group)
+                print(f"  - {tracks[0].artist}: {tracks[0].name} ({len(tracks)} versions)")
+            
+            print("These will be restored to the 'Duplicate Review' playlist for you to try again.")
+            restore_ids = [tid for g in restored_groups for tid in g]
+            self.sp.add_tracks_to_playlist(review_pl.id, restore_ids)
+
+        if kept_duplicate_groups:
+            print(f"\nYou have kept multiple versions for {len(kept_duplicate_groups)} songs:")
+            for group in kept_duplicate_groups:
+                tracks = get_tracks_by_ids(self.db, group)
+                print(f"  - {tracks[0].artist}: {tracks[0].name} ({len(tracks)} versions)")
+            
+            confirm = input("\nIs it okay to allow these duplicates in the future? [y/N]: ").lower()
+            if confirm != 'y':
+                print("Operation aborted. No changes made.")
+                return
+            
+            for group in kept_duplicate_groups:
+                add_to_duplicate_allowlist(self.db, group)
+            print("Allowed duplicates added to database.")
+
+        if tracks_to_delete:
+            print(f"\nDeleting {len(tracks_to_delete)} rejected tracks from storage...")
+            trans_id = create_transaction(self.db, "DELETE", len(tracks_to_delete), "Semantic Deduplication Review")
+            removed_tracks_full = get_tracks_by_ids(self.db, tracks_to_delete)
+            by_playlist = {}
+            for track in removed_tracks_full:
+                if track.storage_playlist_id not in by_playlist:
+                    by_playlist[track.storage_playlist_id] = []
+                by_playlist[track.storage_playlist_id].append(track.id)
+                
+            for pl_id, tids in by_playlist.items():
+                self.sp.remove_tracks_from_playlist(pl_id, tids)
+                
+            mark_tracks_deleted(self.db, tracks_to_delete, trans_id)
+            print(f"Recorded DELETE transaction #{trans_id}")
+
+        if not restored_groups:
+            clear_review_session(self.db)
+            # Clear the review playlist
+            self.sp.remove_tracks_from_playlist(review_pl.id, self.sp.get_playlist_tracks_ordered(review_pl.id))
+            print("\nReview complete. 'Duplicate Review' playlist cleared.")
+        else:
+            print("\nReview partially complete. Group(s) were restored to 'Duplicate Review' playlist for another try.")
+
     def add_artist_to_storage(self, artist_name: str, types: List[str] = ["album"]):
         """Finds artist and interactively lets user select albums/singles to add."""
         artists = self.sp.search_artist(artist_name)
@@ -258,10 +409,8 @@ class Manager:
             print(f"Artist '{artist_name}' not found.")
             return
 
-        selected_artist = None
-        if len(artists) == 1:
-            selected_artist = artists[0]
-        else:
+        selected_artist = artists[0] if len(artists) == 1 else None
+        if not selected_artist:
             print(f"\nMultiple artists found for '{artist_name}':")
             for idx, artist in enumerate(artists, 1):
                 print(f"  [{idx}] {artist['name']} (Pop: {artist['popularity']}, Genres: {', '.join(artist['genres'])})")
@@ -297,7 +446,6 @@ class Manager:
             
             if choice == 'a':
                 selected_indices = set(range(len(all_releases)))
-                # Auto-proceed for 'all' as requested
                 break
             elif choice == 'n':
                 selected_indices = set()
@@ -311,7 +459,6 @@ class Manager:
                     continue
                 break
             elif choice == 's' or choice.isdigit() or choice == 'all' or any(c in choice for c in ', ;'):
-                # Handle 'all' inside the selection loop
                 if choice == 'all':
                     selected_indices = set(range(len(all_releases)))
                     continue
@@ -404,41 +551,258 @@ class Manager:
         
         print(f"Artist '{selected_artist['name']}' added to storage. Transaction #{trans_id}")
 
+    def create_artist_radio(self, artist_name: str, main_count: int, size_filter: str, per_artist: int):
+        """Creates a custom artist radio using the robot scraper for discovery with interactive selection."""
+        artists = self.sp.search_artist(artist_name)
+        if not artists:
+            print(f"Artist '{artist_name}' not found on Spotify.")
+            return
+
+        selected_artist = artists[0] if len(artists) == 1 else None
+        if not selected_artist:
+            print(f"\nMultiple artists found for '{artist_name}':")
+            for idx, artist in enumerate(artists, 1):
+                print(f"  [{idx}] {artist['name']} (Pop: {artist['popularity']}, Genres: {', '.join(artist['genres'])})")
+                print(f"      Top Songs: {artist['top_songs']}")
+            
+            try:
+                choice = int(input(f"\nSelect artist [1-{len(artists)}]: "))
+                selected_artist = artists[choice - 1]
+            except (ValueError, IndexError):
+                print("Invalid choice. Operation cancelled.")
+                return
+
+        artist_id = selected_artist["id"]
+        print(f"Creating radio for {selected_artist['name']}...")
+        
+        main_tracks = self.sp.get_artist_top_tracks(artist_id)
+        selected_track_ids = [t["id"] for t in main_tracks[:main_count]]
+        
+        # Discover Peers via ROBOT SCRAPER ONLY
+        print("Discovering peers via Spotify Web Player robot...")
+        scraped_peers = self.scraper.get_related_artists(artist_id)
+        peer_ids = [p["id"] for p in scraped_peers]
+        
+        if not peer_ids:
+            print("Robot found no peers on the Spotify web player. Aborting.")
+            return
+
+        # Batch fetch profile details (popularity)
+        peer_details = []
+        for i in range(0, len(peer_ids), 50):
+            batch = self.sp.sp.artists(peer_ids[i:i+50])
+            peer_details.extend(batch.get("artists", []) if batch else [])
+
+        if not peer_details:
+            print("Failed to fetch peer details. Aborting.")
+            return
+
+        peer_details.sort(key=lambda x: x["popularity"], reverse=True)
+        midpoint_pop = sum(a['popularity'] for a in peer_details) / len(peer_details)
+        
+        if size_filter == "big":
+            filtered = [a for a in peer_details if a['popularity'] >= midpoint_pop]
+        elif size_filter == "small":
+            filtered = [a for a in peer_details if a['popularity'] < midpoint_pop]
+        else: 
+            filtered = peer_details
+            
+        if not filtered:
+            print(f"No peers matched the filter '{size_filter}'. Aborting.")
+            return
+
+        print(f"Found {len(filtered)} peers matching filter '{size_filter}' (Midpoint: {midpoint_pop:.1f}).")
+        
+        random.shuffle(filtered)
+        added_related = 0
+        for peer in filtered:
+            try:
+                r_tracks = self.sp.get_artist_top_tracks(peer["id"])
+                if r_tracks:
+                    # Take up to per_artist
+                    to_take = min(per_artist, len(r_tracks))
+                    selected_track_ids.extend([t["id"] for t in r_tracks[:to_take]])
+                    added_related += to_take
+                    print(f"  Added {to_take} tracks from {peer['name']}")
+            except SpotifyException:
+                continue
+
+        if added_related == 0:
+            print("No tracks found from discovered peers. Aborting.")
+            return
+
+        radio_name = f"Tawspom Radio: {selected_artist['name']} ({size_filter})"
+        radio_pl = self.sp.get_active_playlist(radio_name)
+        existing_ids = self.sp.get_playlist_tracks_ordered(radio_pl.id)
+        self.sp.remove_tracks_from_playlist(radio_pl.id, existing_ids)
+        
+        random.shuffle(selected_track_ids)
+        self.sp.add_tracks_to_playlist(radio_pl.id, selected_track_ids)
+        
+        print(f"\nRadio playlist '{radio_name}' created with {len(selected_track_ids)} tracks.")
+
+    def find_new_music(self):
+        """Discovers new albums from artists the user already likes (>= 15 listened tracks)."""
+        print("Searching for artists you like (>= 15 listened songs)...")
+        # We query for artist name AND we need to find their ID reliably
+        cur = self.db.cursor()
+        cur.execute("""
+            SELECT artist, id FROM track 
+            WHERE last_played_at IS NOT NULL AND is_deleted = 0
+            GROUP BY artist
+            HAVING COUNT(*) >= 15
+        """)
+        qualifying_rows = cur.fetchall()
+        
+        if not qualifying_rows:
+            print("No artists found with at least 15 listened tracks.")
+            return
+
+        print(f"Found {len(qualifying_rows)} artists to check.")
+        
+        current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
+        now = datetime.now()
+        six_months_ago = now - timedelta(days=180)
+
+        for artist_name, sample_track_id in qualifying_rows:
+            last_check = get_artist_last_check(self.db, artist_name)
+            if last_check and last_check > six_months_ago:
+                continue
+
+            print(f"\n--- Checking artist: {artist_name} ---")
+            
+            # Resolve accurate Artist ID using an existing track ID from our DB
+            try:
+                track_info = self.sp.sp.track(sample_track_id)
+                artist_id = track_info['artists'][0]['id']
+                real_artist_name = track_info['artists'][0]['name']
+                if real_artist_name.lower() != artist_name.lower():
+                    print(f"  Note: Resolved name '{real_artist_name}' for DB entry '{artist_name}'")
+            except Exception as e:
+                print(f"  Error resolving artist ID: {e}")
+                continue
+            
+            # 3. Get all albums from Spotify
+            all_albums = self.sp.get_artist_albums(artist_id, types=["album"])
+            if not all_albums:
+                set_artist_checked(self.db, artist_name)
+                continue
+
+            # 4. Get handled albums (in DB or IGNORED)
+            handled_album_names = get_handled_albums(self.db, artist_name)
+            
+            new_albums = []
+            for album in all_albums:
+                if album["name"].lower() not in handled_album_names:
+                    new_albums.append(album)
+
+            if not new_albums:
+                set_artist_checked(self.db, artist_name)
+                continue
+
+            print(f"  Found {len(new_albums)} potentially new albums.")
+            print(f"  Existing catalog: {', '.join(sorted(list(handled_album_names))[:10])}...")
+
+            for album in new_albums:
+                print(f"\n  [NEW ALBUM] ({album.get('release_date', '0000')[:4]}) {album['name']}")
+                
+                # Similarity check
+                for handled in handled_album_names:
+                    similarity = difflib.SequenceMatcher(None, album["name"].lower(), handled.lower()).ratio()
+                    if similarity > 0.8:
+                        print(f"  WARNING: Name is very similar to existing album: '{handled}' (Similarity: {similarity:.2f})")
+
+                while True:
+                    print("  Action: [y]es (add) / [n]o (skip) / [l]ist tracks / [d]on't ask again / [q]uit command")
+                    choice = input("  > ").lower().strip()
+                    
+                    if choice == 'l':
+                        tracks = self.sp.get_album_tracks(album["id"], album["name"])
+                        print(f"    Tracks in '{album['name']}':")
+                        for idx, t in enumerate(tracks, 1):
+                            print(f"      {idx:2}. {t.name}")
+                        continue
+                    elif choice == 'y':
+                        # Add tracks to storage
+                        tracks = self.sp.get_album_tracks(album["id"], album["name"])
+                        if tracks:
+                            print(f"    Adding {len(tracks)} tracks to storage...")
+                            trans_id = create_transaction(self.db, "ADD", len(tracks), f"findnew: {real_artist_name} - {album['name']}")
+                            
+                            # Group by letter
+                            tracks_by_letter = {}
+                            for t in tracks:
+                                letter = self._get_storage_letter(t.name)
+                                if letter not in tracks_by_letter: tracks_by_letter[letter] = []
+                                tracks_by_letter[letter].append(t)
+                            
+                            for letter, letter_tracks in tracks_by_letter.items():
+                                playlist_id = current_playlists.get(letter)
+                                if not playlist_id:
+                                    playlist_id = self.sp.create_playlist(letter).id
+                                    current_playlists[letter] = playlist_id
+                                
+                                tids = [t.id for t in letter_tracks]
+                                self.sp.add_tracks_to_playlist(playlist_id, tids)
+                                for t in letter_tracks:
+                                    t.storage_playlist_id = playlist_id
+                                    t.add_transaction_id = trans_id
+                                    t.added_at = now
+                                upsert_tracks(self.db, letter_tracks)
+                            print(f"    Added. Transaction #{trans_id}")
+                        break
+                    elif choice == 'n':
+                        print("    Skipped for now.")
+                        break
+                    elif choice == 'd':
+                        print("    Will not ask about this album again.")
+                        add_to_ignored_albums(self.db, artist_name, album["name"])
+                        break
+                    elif choice == 'q':
+                        print("Quitting findnew.")
+                        return
+                    else:
+                        print("  Invalid choice.")
+
+            set_artist_checked(self.db, artist_name)
+
+        print("\nAll qualifying artists checked.")
+
     def _get_current_track_id(self) -> Optional[str]:
         playback = self.sp.get_current_playback()
         if playback and playback.get("item"):
             return playback["item"]["id"]
         return None
 
-    def process_listened_tracks(self, active_playlist_name: str) -> bool:
-        """Identifies listened tracks and marks them in DB."""
+    def process_listened_tracks(self, active_playlist_name: str) -> List[str]:
+        """Identifies listened tracks, marks them in DB, and returns them."""
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
-        if not active_playlist: return False
+        if not active_playlist: return []
 
         track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
         if not track_ids:
-            return True
+            return []
 
         playback = self.sp.get_current_playback()
         if not playback or not playback.get("item"):
             print("Error: Nothing is currently playing. Start playing 'My Active Music' first, or use --flush.")
-            return False
+            return []
 
         current_track_id = playback["item"]["id"]
         context = playback.get("context")
         if not context or context.get("type") != "playlist" or active_playlist.id not in context.get("uri", ""):
             print(f"Error: Currently playing from a different source. To switch to '{active_playlist_name}', start playing it first, or use --flush.")
-            return False
+            return []
 
         try:
             current_index = track_ids.index(current_track_id)
         except ValueError:
             print(f"Error: Currently playing track not found in '{active_playlist_name}'. Use --flush if you want to reset it.")
-            return False
+            return []
 
         listened_ids = track_ids[:current_index]
         if not listened_ids:
-            return True
+            return []
 
         print(f"Marking {len(listened_ids)} tracks as played.")
         now = datetime.now()
@@ -447,22 +811,22 @@ class Manager:
 
         self.sp.remove_tracks_from_playlist(active_playlist.id, listened_ids)
         remove_active_tracks(self.db, listened_ids)
-        return True
+        return listened_ids
 
-    def flush_active_playlist(self, active_playlist_name: str):
-        """Marks all tracks (except currently playing) as played and clears them."""
+    def flush_active_playlist(self, active_playlist_name: str) -> List[str]:
+        """Marks all tracks (except currently playing) as played, clears them, and returns them."""
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
-        if not active_playlist: return
+        if not active_playlist: return []
 
         track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
-        if not track_ids: return
+        if not track_ids: return []
 
         current_track_id = self._get_current_track_id()
         to_remove = [tid for tid in track_ids if tid != current_track_id]
         
         if not to_remove:
             print("Only the currently playing track remains. Skipping flush.")
-            return
+            return []
 
         print(f"Flushing {len(to_remove)} tracks from '{active_playlist_name}'.")
         now = datetime.now()
@@ -471,6 +835,7 @@ class Manager:
         
         self.sp.remove_tracks_from_playlist(active_playlist.id, to_remove)
         remove_active_tracks(self.db, to_remove)
+        return to_remove
 
     def detect_manual_removals(self, current_active_ids: List[str]):
         """Detects if user manually removed tracks from 'Active Music' and removes from storage."""
@@ -503,16 +868,26 @@ class Manager:
         print(f"Manual removals processed. Transaction #{trans_id}")
 
     def refill_active_playlist(self, active_playlist_name: str, target_hours: float, mode: str = "default"):
+        listened_ids = []
+        active_playlist = self.sp.get_active_playlist(active_playlist_name)
+        
         if mode == "flush":
-            self.flush_active_playlist(active_playlist_name)
+            listened_ids = self.flush_active_playlist(active_playlist_name)
         elif mode == "add":
             print("Mode 'add': Just adding more tracks.")
         else: # default
-            if not self.process_listened_tracks(active_playlist_name):
-                print("Aborting refill due to missing playback context.")
-                return
+            listened_ids = self.process_listened_tracks(active_playlist_name)
+            if not listened_ids:
+                # Check if playlist is not empty AND we can't determine playback
+                current_count = len(self.sp.get_playlist_tracks_ordered(active_playlist.id))
+                if current_count > 0 and self._get_current_track_id() is None:
+                    # process_listened_tracks already printed the error
+                    return
 
-        active_playlist = self.sp.get_active_playlist(active_playlist_name)
+        # Handle 'Phone Listening' history
+        if listened_ids:
+            self._update_phone_listening(listened_ids)
+
         target_ms = int(target_hours * 3600 * 1000)
 
         print("Fetching current active playlist state...")
@@ -580,6 +955,22 @@ class Manager:
             self.sp.add_tracks_to_playlist(active_playlist.id, to_add)
             add_active_tracks(self.db, to_add)
             print("Refill complete.")
+
+    def _update_phone_listening(self, track_ids: List[str]):
+        """Adds tracks to 'Phone Listening' if it's shorter than 100 hours."""
+        pl = self.sp.get_active_playlist("Phone Listening")
+        
+        # Check current duration
+        print("Checking 'Phone Listening' capacity...")
+        current_tracks = self.sp.get_playlist_tracks(pl.id)
+        current_ms = sum(t.duration_ms for t in current_tracks)
+        
+        limit_ms = 100 * 3600 * 1000
+        if current_ms < limit_ms:
+            print(f"  Adding {len(track_ids)} tracks to history...")
+            self.sp.add_tracks_to_playlist(pl.id, track_ids)
+        else:
+            print("  'Phone Listening' is full (>= 100 hours). Skipping history update.")
 
     def list_adds(self):
         transactions = [t for t in list_transactions(self.db, "ADD")]

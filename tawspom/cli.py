@@ -20,7 +20,18 @@ def main():
     subparsers.add_parser("ingest", help="Move all 'Liked Songs' to A-Z storage playlists")
 
     # Maintenance
-    subparsers.add_parser("deduplicate", help="Find and remove duplicate tracks from storage")
+    subparsers.add_parser("deduplicate", help="Find and remove binary duplicates from storage")
+    subparsers.add_parser("findversions", help="Find potential versions of songs and put in 'Duplicate Review' playlist")
+    subparsers.add_parser("processversions", help="Process the 'Duplicate Review' playlist and delete removed tracks")
+    subparsers.add_parser("findnew", help="Find new albums from artists you have listened to (>= 15 songs)")
+
+    # Radio
+    radio_parser = subparsers.add_parser("artistradio", help="Create a custom artist radio playlist")
+    radio_parser.add_argument("name", help="Name of the artist")
+    radio_parser.add_argument("--main-count", type=int, default=10, help="Number of songs from the main artist (default: 10)")
+    radio_parser.add_argument("--per-artist", type=int, default=5, help="Number of songs to take from EACH discovered related artist (default: 5)")
+    radio_parser.add_argument("--filter", choices=["big", "small", "both"], default="both", 
+                              help="Filter related artists by size (big = top 50%%, small = bottom 50%%, both = all)")
 
     # Add Artist
     add_artist_parser = subparsers.add_parser("addartist", help="Add studio tracks of an artist to storage")
@@ -80,6 +91,14 @@ def main():
         manager.ingest_liked_songs()
     elif args.command == "deduplicate":
         manager.deduplicate_storage()
+    elif args.command == "findversions":
+        manager.find_version_duplicates()
+    elif args.command == "processversions":
+        manager.process_version_review()
+    elif args.command == "findnew":
+        manager.find_new_music()
+    elif args.command == "artistradio":
+        manager.create_artist_radio(args.name, args.main_count, args.filter, args.per_artist)
     elif args.command == "addartist":
         types = ["album"]
         if args.single:

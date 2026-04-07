@@ -96,15 +96,11 @@ class SpotifyClient:
             offset += 50
         
         filtered = {}
-        # Keywords to avoid in standard collection unless specifically asked
         skip_keywords = ["live", "deluxe", "expanded", "bonus", "remaster", "edition", "super"]
-        
-        # Sort by release date descending
         albums.sort(key=lambda x: x.get("release_date", "0000"), reverse=True)
 
         for album in albums:
             name_lower = album["name"].lower()
-            # If it's a single, we are less aggressive with filtering
             if album["album_type"] != "single" and any(k in name_lower for k in skip_keywords):
                 continue
             
@@ -255,3 +251,14 @@ class SpotifyClient:
                 break
             offset += limit
         return track_ids
+
+    def search_artists_by_genre(self, genre: str, limit: int = 50) -> List[dict]:
+        """Discovers artists by searching for a specific genre."""
+        query = f"genre:\"{genre}\""
+        res = self._call_with_retry(self.sp.search, q=query, type="artist", limit=limit)
+        return res.get("artists", {}).get("items", []) if res else []
+
+    def get_artist_top_tracks(self, artist_id: str, country: str = 'US') -> List[dict]:
+        """Fetches top tracks for an artist."""
+        res = self._call_with_retry(self.sp.artist_top_tracks, artist_id, country=country)
+        return res.get("tracks", []) if res else []
