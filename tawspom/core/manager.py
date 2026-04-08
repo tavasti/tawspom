@@ -5,6 +5,7 @@ import sys
 import unicodedata
 import random
 import difflib
+import statistics
 from spotipy.exceptions import SpotifyException
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.lastfm import LastFMClient
@@ -860,7 +861,6 @@ class Manager:
             by_playlist[track.storage_playlist_id].append(track.id)
             
         for pl_id, tids in by_playlist.items():
-            print(f"Removing {len(tids)} tracks from storage playlist {pl_id}...")
             self.sp.remove_tracks_from_playlist(pl_id, tids)
             
         mark_tracks_deleted(self.db, removed_ids, trans_id)
@@ -891,6 +891,7 @@ class Manager:
         target_ms = int(target_hours * 3600 * 1000)
 
         print("Fetching current active playlist state...")
+        # Get full track objects so we can see artists for lock initialization
         current_tracks_on_spotify = self.sp.get_playlist_tracks(active_playlist.id)
         current_track_ids_set = set(t.id for t in current_tracks_on_spotify)
 
@@ -905,65 +906,83 @@ class Manager:
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
         
-        print("Gathering candidate tracks from library...")
-        pool = get_least_recently_played_tracks(self.db, limit=5000)
+        # 1. Fetch large pool of oldest tracks (Increased to 30,000 to cover entire library)
+        print("Gathering candidate tracks from library (Oldest first)...")
+        pool = get_least_recently_played_tracks(self.db, limit=30000)
         
-        print(f"Analyzing {len(pool)} candidates...")
-        candidates_by_lead_artist: Dict[str, List[Track]] = {}
-        for track in pool:
-            if track.id not in current_track_ids_set:
-                lead_artist = track.artist.split(',')[0].strip()
-                if lead_artist not in candidates_by_lead_artist:
-                    candidates_by_lead_artist[lead_artist] = []
-                candidates_by_lead_artist[lead_artist].append(track)
+        # 2. Setup Artist Locks based on current playlist tail
+        # Artists in the last 10 songs of the current playlist are already locked
+        artist_locks = {} # artist_name -> index at which they become available
+        current_fill_index = 0
         
-        for artist_tracks in candidates_by_lead_artist.values():
-            random.shuffle(artist_tracks)
-            
-        artist_names = list(candidates_by_lead_artist.keys())
-        random.shuffle(artist_names)
-        
-        to_add = []
+        tail_10 = current_tracks_on_spotify[-10:]
+        for i, t in enumerate(tail_10):
+            dist_from_end = len(tail_10) - i
+            lock_remaining = 10 - dist_from_end
+            if lock_remaining > 0:
+                artists = [a.strip() for a in t.artist.split(',')]
+                for a in artists:
+                    artist_locks[a] = max(artist_locks.get(a, 0), lock_remaining)
+
+        # 3. Selection Strategy: Absolute Oldest first with 10-song spreading
+        to_add_ids = []
+        added_play_counts = []
         added_duration = 0
         unique_artists_added = set()
+        skipped_locked_count = 0
         
-        last_artist_str = current_tracks_on_spotify[-1].artist if current_tracks_on_spotify else ""
-        last_lead_artist = last_artist_str.split(',')[0].strip() if last_artist_str else ""
-        
-        print("Selecting tracks using Fair Lead-Artist Round-Robin...")
-        while artist_names and added_duration < needed_ms:
-            for artist in list(artist_names):
-                if added_duration >= needed_ms:
-                    break
+        print("Selecting tracks using Time-Queue with Spreading (10-song window)...")
+        for track in pool:
+            if added_duration >= needed_ms:
+                break
+            
+            if track.id in current_track_ids_set:
+                continue
                 
-                if artist == last_lead_artist and len(artist_names) > 1:
-                    continue
+            # Check if any artist on this track is locked
+            track_artists = [a.strip() for a in track.artist.split(',')]
+            is_locked = any(artist_locks.get(a, 0) > current_fill_index for a in track_artists)
+            
+            if is_locked:
+                skipped_locked_count += 1
+                continue
                 
-                track = candidates_by_lead_artist[artist].pop(0)
-                
-                to_add.append(track.id)
-                added_duration += track.duration_ms
-                last_lead_artist = artist
-                unique_artists_added.add(artist)
-                
-                if not candidates_by_lead_artist[artist]:
-                    artist_names.remove(artist)
+            # Track is available!
+            to_add_ids.append(track.id)
+            added_play_counts.append(track.play_count)
+            added_duration += track.duration_ms
+            
+            # Increment fill index and update locks
+            current_fill_index += 1
+            for a in track_artists:
+                artist_locks[a] = current_fill_index + 10
+                unique_artists_added.add(a)
 
-        if to_add:
-            print(f"Selected {len(to_add)} tracks from {len(unique_artists_added)} different lead artists.")
+        if to_add_ids:
+            print(f"Selected {len(to_add_ids)} tracks from {len(unique_artists_added)} different artists. (Skipped {skipped_locked_count} locked tracks)")
+            
+            # Report statistics
+            if added_play_counts:
+                low = min(added_play_counts)
+                high = max(added_play_counts)
+                avg = sum(added_play_counts) / len(added_play_counts)
+                med = statistics.median(added_play_counts)
+                print(f"Play count stats for added songs: Low: {low}, Avg: {avg:.1f}, Median: {med}, High: {high}")
+
             print(f"Adding selected tracks to '{active_playlist_name}'...")
-            self.sp.add_tracks_to_playlist(active_playlist.id, to_add)
-            add_active_tracks(self.db, to_add)
+            self.sp.add_tracks_to_playlist(active_playlist.id, to_add_ids)
+            add_active_tracks(self.db, to_add_ids)
             print("Refill complete.")
+        else:
+            print(f"Warning: Could not find any tracks to add. (Processed {len(pool)} candidates, skipped {skipped_locked_count} due to locks)")
 
     def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
         """Adds tracks to the specified phone history playlist if it's shorter than 100 hours."""
         pl = self.sp.get_active_playlist(phone_playlist_name)
         
-        # Check current duration
+        # Check current duration efficiently
         print(f"Checking '{phone_playlist_name}' capacity...")
-        current_tracks = self.sp.get_playlist_tracks(pl.id)
-        current_ms = sum(t.duration_ms for t in current_tracks)
+        current_ms = self.sp.get_playlist_duration_ms(pl.id)
         
         limit_ms = 100 * 3600 * 1000
         if current_ms < limit_ms:

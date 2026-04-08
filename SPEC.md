@@ -29,19 +29,21 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 ### 3.1 The "Active" Playlist (Refill)
 The primary listening source is a configurable rolling window (default 12 hours).
 - **Configuration**: Playlist name is set via `ACTIVE_PLAYLIST_NAME` in `.env` (default: "My Active Music").
-- **Refill Logic**:
-    - **Fair Lead-Artist Round-Robin**: The system picks one track per artist in a rotating loop to ensure maximum variety.
-    - **Artist Locking**: When a track is picked, all credited artists on that track are "locked" for the remainder of that round-robin cycle.
-    - **Least Recently Played**: Priority is given to tracks that haven't been played in the longest time.
+- **Refill Logic (Time-Queue with Spreading)**:
+    - **Oldest First**: Candidate tracks are fetched in absolute order of their `last_played_at` date (ascending).
+    - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are **locked for the next 10 tracks**. 
+    - **Exhaustive Search**: The system scans up to 30,000 oldest candidates to find enough tracks that satisfy the 10-song variety window.
+- **Statistical Reporting**: At the end of each refill, the system reports the play count distribution of the newly added tracks (**Low, Average, Median, High**).
 - **Preservation**:
     - Never remove the currently playing song.
     - If playback position cannot be determined (and playlist isn't empty), the refill aborts to prevent losing the user's place.
-- **Manual Removal Detection**: If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well (interpreting it as "I don't like this song anymore").
+- **Manual Removal Detection**: If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well. This background operation is silent to keep the UI clean.
 
 ### 3.2 Phone History (Phone Listening)
 - On every `refill` run, tracks identified as "listened" are appended to a secondary history playlist.
 - **Configuration**: Playlist name is set via `PHONE_PLAYLIST_NAME` in `.env` (default: "Phone Listening").
 - **Capacity**: This addition only occurs if the playlist is currently **shorter than 100 hours**.
+- **Optimization**: Duration checks use field-filtering to minimize API payload and prevent timeouts.
 - **Note**: This history is one-way and is not tracked in the local database.
 
 ---
@@ -91,6 +93,7 @@ The primary listening source is a configurable rolling window (default 12 hours)
 - **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, and `handled_albums`.
 - **Batching**: All Spotify removals and additions are batched (Playlists: 100, Liked Songs: 20) to prevent `400 Bad Request` errors.
 - **API Wrapper**: A centralized `_call_with_retry` function handles `ConnectionResetError` and Spotify Rate Limits with exponential backoff.
+- **API Timeout**: Extended to **10 seconds** to handle massive playlist operations.
 - **Environment**: Configuration via `.env` file.
     - `SPOTIPY_CLIENT_ID`
     - `SPOTIPY_CLIENT_SECRET`

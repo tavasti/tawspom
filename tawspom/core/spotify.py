@@ -21,14 +21,18 @@ class SpotifyClient:
         cache_path = os.path.expanduser(f"~/.tawspom/token_{self.user_label}.json")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         
-        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-            scope=self.scope,
-            client_id=os.getenv("SPOTIPY_CLIENT_ID"),
-            client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
-            redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-            cache_path=cache_path,
-            open_browser=False
-        ))
+        # Increase timeout to 10s to handle large playlist requests
+        self.sp = spotipy.Spotify(
+            auth_manager=SpotifyOAuth(
+                scope=self.scope,
+                client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+                client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
+                redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
+                cache_path=cache_path,
+                open_browser=False
+            ),
+            requests_timeout=10
+        )
 
     def _call_with_retry(self, func, *args, **kwargs):
         """Wraps a Spotify API call with a retry mechanism for connection errors."""
@@ -167,6 +171,32 @@ class SpotifyClient:
             offset += limit
 
         return tracks
+
+    def get_playlist_duration_ms(self, playlist_id: str) -> int:
+        """Calculates total duration of a playlist efficiently by only fetching duration fields."""
+        total_ms = 0
+        offset = 0
+        limit = 100
+        while True:
+            result = self._call_with_retry(
+                self.sp.playlist_items, 
+                playlist_id, 
+                fields="items(track(duration_ms)),next", 
+                limit=limit, 
+                offset=offset
+            )
+            if not result:
+                break
+            items = result.get("items", [])
+            for item in items:
+                t = item.get("track")
+                if t:
+                    total_ms += t.get("duration_ms", 0)
+            
+            if not result.get("next"):
+                break
+            offset += limit
+        return total_ms
 
     def get_liked_songs(self) -> List[Track]:
         """Fetches all tracks from 'Liked Songs'."""

@@ -12,3 +12,5 @@ __pycache__/
 # Specific files/dirs to ignore
 # __pycache__ directories
 **/__pycache__/
+# tmp has material needed during devel
+tmp/

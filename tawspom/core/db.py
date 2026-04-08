@@ -103,9 +103,7 @@ def init_db():
         cur.execute("ALTER TABLE track ADD COLUMN add_transaction_id INTEGER")
         cur.execute("ALTER TABLE track ADD COLUMN delete_transaction_id INTEGER")
     if 'play_count' not in cols:
-        print("Migrating: Adding play_count column to track table...")
         cur.execute("ALTER TABLE track ADD COLUMN play_count INTEGER DEFAULT 0")
-        # For tracks already played, set count to 1
         cur.execute("UPDATE track SET play_count = 1 WHERE last_played_at IS NOT NULL")
 
     cur.execute("PRAGMA table_info(transactions)")
@@ -259,7 +257,7 @@ def mark_as_played(conn, track_id: str, played_at: datetime):
 def get_least_recently_played_tracks(conn, limit: int = 1000) -> List[Track]:
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at 
+        SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, play_count
         FROM track WHERE is_deleted = 0
         ORDER BY last_played_at ASC NULLS FIRST, RANDOM()
         LIMIT ?
@@ -267,7 +265,9 @@ def get_least_recently_played_tracks(conn, limit: int = 1000) -> List[Track]:
     tracks = []
     for row in cur.fetchall():
         last_played = datetime.fromisoformat(row[6]) if row[6] else None
-        tracks.append(Track(row[0], row[1], row[2], row[3], row[4], row[5], last_played))
+        t = Track(row[0], row[1], row[2], row[3], row[4], row[5], last_played)
+        t.play_count = row[7]
+        tracks.append(t)
     return tracks
 
 def delete_tracks_permanently(conn, older_than_days: int):
