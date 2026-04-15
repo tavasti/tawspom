@@ -11,7 +11,7 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 - **Mapping Logic**:
     - Finnish characters: `Ä`, `Å` -> `A`; `Ö` -> `O`.
     - Accents: `È` -> `E`, `Ŝ` -> `S`, etc. (Normalized to base ASCII).
-    - Numbers and Symbols: Default to storage playlist `A`.
+    - Numbers and Symbols: Default to storage playlist defined by `DEFAULT_STORAGE_LETTER` (Default: "A").
 - **Sync Process**:
     1. **Ingest**: Move all "Liked Songs" to appropriate A-Z playlists.
     2. **Deduplicate**: Identify and list potential duplicates for user review.
@@ -27,7 +27,7 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 
 ## 3. Listening Experience
 ### 3.1 The "Active" Playlist (Refill)
-The primary listening source is a configurable rolling window (default 12 hours).
+The primary listening source is a configurable rolling window defined by `DEFAULT_REFILL_HOURS` (Default: 15 hours).
 - **Configuration**: Playlist name is set via `ACTIVE_PLAYLIST_NAME` in `.env` (default: "My Active Music").
 - **Library Dashboard**: At the end of every refill, a dashboard displays:
     - **Counts**: Total active tracks, total duration, and deleted tracks.
@@ -36,12 +36,12 @@ The primary listening source is a configurable rolling window (default 12 hours)
         - **Library listening time**: Cumulative listening for current (active) songs.
         - **with deleted songs**: Absolute lifetime listening including removed tracks.
         - **Avg plays**: Average play count per track.
-    - **Momentum**: Total time listened in the last 7 days.
-    - **Queue Health**: Date of the oldest song waiting in the queue and top 3 artists currently at the front of the queue.
+    - **Momentum**: Total time listened in the window defined by `MOMENTUM_WINDOW_DAYS` (Default: 7 days).
+    - **Queue Health**: Date of the oldest song waiting in the queue and top 3 artists currently at the front of the queue (identified from a pool of size `DASHBOARD_OLD_POOL_SIZE`, Default: 1000).
 - **Refill Logic (Time-Queue with Spreading)**:
     - **Oldest First**: Candidate tracks are fetched in absolute order of their `last_played_at` date (ascending).
-    - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are **locked for the next 10 tracks**. 
-    - **Exhaustive Search**: The system scans up to 30,000 oldest candidates to find enough tracks that satisfy the 10-song variety window.
+    - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are locked for the next `REFILL_ARTIST_LOCK_WINDOW` tracks (Default: 5). 
+    - **Exhaustive Search**: The system scans up to `REFILL_CANDIDATE_POOL_SIZE` oldest candidates to find enough tracks that satisfy the variety window (Default: 2000).
 - **Statistical Reporting**: At the end of each refill, the system reports the play count distribution of the newly added tracks (**Low, Average, Median, High**).
 - **Preservation**:
     - Never remove the currently playing song.
@@ -51,20 +51,62 @@ The primary listening source is a configurable rolling window (default 12 hours)
 ### 3.2 Phone History (Phone Listening)
 - On every `refill` run, tracks identified as "listened" are appended to a secondary history playlist.
 - **Configuration**: Playlist name is set via `PHONE_PLAYLIST_NAME` in `.env` (default: "Phone Listening").
-- **Capacity**: This addition only occurs if the playlist is currently **shorter than 100 hours**.
+- **Capacity**: This addition only occurs if the playlist is currently shorter than `PHONE_PLAYLIST_CAPACITY_HOURS` (Default: 100 hours).
 - **Optimization**: Duration checks use field-filtering to minimize API payload and prevent timeouts.
 - **Note**: This history is one-way and is not tracked in the local database.
 
 ---
 
 ## 4. Deduplication
-...
+### 4.1 Binary Deduplication
+- Identifies tracks with the same Artist + Name and a duration within `BINARY_DEDUPE_THRESHOLD_MS` (Default: 2000ms).
+- **Interactive Review**: Always lists the "KEEP" and "DELETE" versions for user review before proceeding.
+- **Selection Logic**: Automatically proposes keeping the version with more play history or the oldest `added_at` date.
+
+### 4.2 Semantic Deduplication (findversions)
+- **Root Name Logic**: Uses regex to strip suffixes matching `ROOT_NAME_FORBIDDEN_KEYWORDS`.
+- **Bridge Workflow**:
+    1. Potential duplicates are moved to a "Duplicate Review" playlist.
+    2. The user listens and deletes the versions they don't want.
+    3. `processversions` deletes the missing tracks from storage and adds the remaining ones to a `duplicate_allowlist` so they aren't flagged again.
+    4. **Safety**: If a user accidentally deletes ALL versions of a song in the review playlist, the system restores them all to the playlist for a second chance.
+- **Review Session Limit**: Limits the number of groups in a session to `VERSION_REVIEW_GROUP_LIMIT` (Default: 20).
+
+---
+
+## 5. Discovery Tools
+### 5.1 Artist Radio (artistradio)
+- **Discovery Engine**: Uses a **Headless Robot (Playwright)** to scrape the "Fans Also Like" section from the Spotify Web Player.
+- **Filtering**:
+    - Calculates the midpoint popularity of the discovered group.
+    - Supports `--filter`: `big` (above midpoint), `small` (below midpoint), or `both`.
+- **Scalability**: No total song limit. Takes `--per-artist` tracks from **every** peer found.
+- **Selection**: Uses Round-Robin to ensure every discovered artist is represented before taking a second song from any one artist.
+
+### 5.2 Deep Discovery (findnew)
+- **Targeting**: Checks artists where the user has listened to at least `FINDNEW_QUALIFY_MIN_TRACKS` tracks (Default: 8).
+- **Cooldown**: Artists are only checked once every `FINDNEW_ARTIST_COOLDOWN_DAYS` (Default: 180 days).
+- **Precision**: 
+    - Resolves the exact Spotify Artist ID using existing tracks from the DB to prevent name collisions.
+    - **Fuzzy Matching**: Flags new albums if their name is highly similar (exceeding `FINDNEW_ALBUM_SIMILARITY_THRESHOLD`, Default: 0.8) to albums already in the catalog.
+- **Interface**:
+    - Displays existing catalog for context.
+    - Interactive options: 
+        - `[y]es`: Add all tracks from the album to A-Z storage.
+        - `[n]o`: Skip for now.
+        - `[l]ist`: Show tracks within the album before deciding.
+        - `[d]on't ask again`: Permanently ignore this album.
+        - `[q]uit`: Exit the command.
+
+---
 
 ## 6. Technical Specifications
 - **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, and `handled_albums`.
-- **Batching**: All Spotify removals and additions are batched (Playlists: 100, Liked Songs: 20) to prevent `400 Bad Request` errors.
-- **API Wrapper**: A centralized `_call_with_retry` function handles `ConnectionResetError` and Spotify Rate Limits with exponential backoff.
-- **API Timeout**: Extended to **10 seconds** to handle massive playlist operations.
+- **Batching**: 
+    - Playlists: `SPOTIFY_PLAYLIST_BATCH_SIZE` (Default: 100).
+    - Liked Songs: `SPOTIFY_LIKED_SONGS_BATCH_SIZE` (Default: 20).
+- **API Wrapper**: A centralized `_call_with_retry` function handles connection errors and rate limits using `SPOTIFY_MAX_RETRIES` (Default: 3) and `SPOTIFY_RETRY_DELAY` (Default: 2s).
+- **API Timeout**: Configured via `SPOTIFY_API_TIMEOUT` (Default: 10s).
 - **Environment**: Configuration via `.env` file.
     - `SPOTIPY_CLIENT_ID`
     - `SPOTIPY_CLIENT_SECRET`

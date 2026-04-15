@@ -7,6 +7,11 @@ from spotipy.oauth2 import SpotifyOAuth
 from requests.exceptions import ConnectionError
 from urllib3.exceptions import ProtocolError
 from tawspom.models import Track, Playlist
+from tawspom.core.constants import (
+    SPOTIFY_API_TIMEOUT, SPOTIFY_MAX_RETRIES, SPOTIFY_RETRY_DELAY,
+    SPOTIFY_PLAYLIST_BATCH_SIZE, SPOTIFY_LIKED_SONGS_BATCH_SIZE,
+    ALBUM_SKIP_KEYWORDS, ARTIST_SEARCH_LIMIT
+)
 
 load_dotenv()
 
@@ -21,7 +26,6 @@ class SpotifyClient:
         cache_path = os.path.expanduser(f"~/.tawspom/token_{self.user_label}.json")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         
-        # Increase timeout to 10s to handle large playlist requests
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
                 scope=self.scope,
@@ -31,20 +35,19 @@ class SpotifyClient:
                 cache_path=cache_path,
                 open_browser=False
             ),
-            requests_timeout=10
+            requests_timeout=SPOTIFY_API_TIMEOUT
         )
 
     def _call_with_retry(self, func, *args, **kwargs):
         """Wraps a Spotify API call with a retry mechanism for connection errors."""
-        max_retries = 3
-        for i in range(max_retries):
+        for i in range(SPOTIFY_MAX_RETRIES):
             try:
                 return func(*args, **kwargs)
             except (ConnectionError, ProtocolError) as e:
-                if i == max_retries - 1:
+                if i == SPOTIFY_MAX_RETRIES - 1:
                     raise
-                print(f"\nConnection error: {e}. Retrying in 2 seconds... (Attempt {i+1}/{max_retries})")
-                time.sleep(2)
+                print(f"\nConnection error: {e}. Retrying in {SPOTIFY_RETRY_DELAY} seconds... (Attempt {i+1}/{SPOTIFY_MAX_RETRIES})")
+                time.sleep(SPOTIFY_RETRY_DELAY)
                 self._init_sp()
         return None
 
@@ -68,8 +71,8 @@ class SpotifyClient:
         return playlists
 
     def search_artist(self, name: str) -> List[dict]:
-        """Returns a list of the top 30 artists found matching the name, including top tracks."""
-        results = self._call_with_retry(self.sp.search, q=f"artist:{name}", type="artist", limit=30)
+        """Returns a list of the top artists found matching the name, including top tracks."""
+        results = self._call_with_retry(self.sp.search, q=f"artist:{name}", type="artist", limit=ARTIST_SEARCH_LIMIT)
         items = results.get("artists", {}).get("items", [])
         
         artists = []
@@ -100,12 +103,11 @@ class SpotifyClient:
             offset += 50
         
         filtered = {}
-        skip_keywords = ["live", "deluxe", "expanded", "bonus", "remaster", "edition", "super"]
         albums.sort(key=lambda x: x.get("release_date", "0000"), reverse=True)
 
         for album in albums:
             name_lower = album["name"].lower()
-            if album["album_type"] != "single" and any(k in name_lower for k in skip_keywords):
+            if album["album_type"] != "single" and any(k in name_lower for k in ALBUM_SKIP_KEYWORDS):
                 continue
             
             if album["name"] not in filtered:
@@ -146,7 +148,7 @@ class SpotifyClient:
         """Fetches all tracks from a given playlist."""
         tracks = []
         offset = 0
-        limit = 100
+        limit = SPOTIFY_PLAYLIST_BATCH_SIZE
 
         while True:
             result = self._call_with_retry(self.sp.playlist_items, playlist_id, limit=limit, offset=offset)
@@ -176,7 +178,7 @@ class SpotifyClient:
         """Calculates total duration of a playlist efficiently by only fetching duration fields."""
         total_ms = 0
         offset = 0
-        limit = 100
+        limit = SPOTIFY_PLAYLIST_BATCH_SIZE
         while True:
             result = self._call_with_retry(
                 self.sp.playlist_items, 
@@ -226,10 +228,11 @@ class SpotifyClient:
         return tracks
 
     def remove_liked_songs(self, track_ids: List[str]):
-        """Removes tracks from 'Liked Songs'. Using safe batch size of 20."""
+        """Removes tracks from 'Liked Songs' using safe batch size."""
         if not track_ids: return
-        for i in range(0, len(track_ids), 20):
-            self._call_with_retry(self.sp.current_user_saved_tracks_delete, tracks=track_ids[i:i+20])
+        batch_size = SPOTIFY_LIKED_SONGS_BATCH_SIZE
+        for i in range(0, len(track_ids), batch_size):
+            self._call_with_retry(self.sp.current_user_saved_tracks_delete, tracks=track_ids[i:i+batch_size])
 
     def get_active_playlist(self, name: str) -> Optional[Playlist]:
         """Finds or creates an 'Active' playlist by name."""
@@ -255,24 +258,26 @@ class SpotifyClient:
         return self._call_with_retry(self.sp.current_playback)
 
     def remove_tracks_from_playlist(self, playlist_id: str, track_ids: List[str]):
-        """Removes a list of tracks from a playlist."""
+        """Removes a list of tracks from a playlist using batches."""
         if not track_ids:
             return
-        for i in range(0, len(track_ids), 100):
-            self._call_with_retry(self.sp.playlist_remove_all_occurrences_of_items, playlist_id, track_ids[i:i+100])
+        batch_size = SPOTIFY_PLAYLIST_BATCH_SIZE
+        for i in range(0, len(track_ids), batch_size):
+            self._call_with_retry(self.sp.playlist_remove_all_occurrences_of_items, playlist_id, track_ids[i:i+batch_size])
 
     def add_tracks_to_playlist(self, playlist_id: str, track_ids: List[str]):
-        """Adds a list of tracks to a playlist."""
+        """Adds a list of tracks to a playlist using batches."""
         if not track_ids:
             return
-        for i in range(0, len(track_ids), 100):
-            self._call_with_retry(self.sp.playlist_add_items, playlist_id, track_ids[i:i+100])
+        batch_size = SPOTIFY_PLAYLIST_BATCH_SIZE
+        for i in range(0, len(track_ids), batch_size):
+            self._call_with_retry(self.sp.playlist_add_items, playlist_id, track_ids[i:i+batch_size])
 
     def get_playlist_tracks_ordered(self, playlist_id: str) -> List[str]:
         """Returns track IDs in the order they appear in the playlist."""
         track_ids = []
         offset = 0
-        limit = 100
+        limit = SPOTIFY_PLAYLIST_BATCH_SIZE
         while True:
             result = self._call_with_retry(self.sp.playlist_items, playlist_id, fields="items(track(id))", limit=limit, offset=offset)
             items = result.get("items", [])

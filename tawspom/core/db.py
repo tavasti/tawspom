@@ -3,6 +3,10 @@ import os
 from typing import List, Optional, Tuple, Set, Dict
 from datetime import datetime, timedelta
 from tawspom.models import Track, Transaction
+from tawspom.core.constants import (
+    MOMENTUM_WINDOW_DAYS, DASHBOARD_OLD_POOL_SIZE,
+    FINDNEW_QUALIFY_MIN_TRACKS
+)
 
 DB_PATH = os.getenv("DB_PATH", os.path.expanduser("~/.local/share/tawspom/tawspom.sqlite3"))
 
@@ -74,6 +78,7 @@ def init_db():
         )
     """)
 
+    # New tables for 'findnew' feature
     cur.execute("""
         CREATE TABLE IF NOT EXISTS artist_checks (
             artist_name TEXT PRIMARY KEY,
@@ -362,19 +367,19 @@ def get_library_stats(conn) -> Dict:
     cur.execute("SELECT SUM(play_count * duration_ms) FROM track")
     full_listening_time_ms = cur.fetchone()[0] or 0
     
-    # Momentum (Last 7 days)
-    seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
-    cur.execute("SELECT SUM(duration_ms) FROM track WHERE last_played_at > ? AND is_deleted = 0", (seven_days_ago,))
+    # Momentum (Configurable window)
+    momentum_threshold = (datetime.now() - timedelta(days=MOMENTUM_WINDOW_DAYS)).isoformat()
+    cur.execute("SELECT SUM(duration_ms) FROM track WHERE last_played_at > ? AND is_deleted = 0", (momentum_threshold,))
     momentum_ms = cur.fetchone()[0] or 0
     
     # Queue Lag
     cur.execute("SELECT MIN(last_played_at) FROM track WHERE last_played_at IS NOT NULL AND is_deleted = 0")
     oldest_waiting_at = cur.fetchone()[0]
     
-    # Top Waiting Artists (from oldest 1000)
-    cur.execute("""
+    # Top Waiting Artists (Configurable pool size)
+    cur.execute(f"""
         SELECT artist, COUNT(*) as c FROM (
-            SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT 1000
+            SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT {DASHBOARD_OLD_POOL_SIZE}
         ) GROUP BY artist ORDER BY c DESC LIMIT 3
     """)
     top_waiting_artists = cur.fetchall()

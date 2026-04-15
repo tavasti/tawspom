@@ -23,6 +23,12 @@ from tawspom.core.db import (
     get_artist_last_check, set_artist_checked, get_handled_albums, add_to_ignored_albums
 )
 from tawspom.models import Track, Playlist, Transaction
+from tawspom.core.constants import (
+    DEFAULT_STORAGE_LETTER, REFILL_ARTIST_LOCK_WINDOW, REFILL_CANDIDATE_POOL_SIZE,
+    BINARY_DEDUPE_THRESHOLD_MS, ROOT_NAME_FORBIDDEN_KEYWORDS, VERSION_REVIEW_GROUP_LIMIT,
+    FINDNEW_QUALIFY_MIN_TRACKS, FINDNEW_ARTIST_COOLDOWN_DAYS, FINDNEW_ALBUM_SIMILARITY_THRESHOLD,
+    MOMENTUM_WINDOW_DAYS, PHONE_PLAYLIST_CAPACITY_HOURS
+)
 
 class Manager:
     def __init__(self, sp_client: SpotifyClient, db_conn):
@@ -34,19 +40,24 @@ class Manager:
     def _get_storage_letter(self, name: str) -> str:
         """Maps a track name to a single A-Z letter, handling accents and special characters."""
         if not name:
-            return "A"
+            return DEFAULT_STORAGE_LETTER
         
+        # Standardize to uppercase for matching
         name = name.upper()
+        
+        # Specific mapping for Finnish characters
         name = name.replace('Ä', 'A').replace('Å', 'A').replace('Ö', 'O')
         
+        # Normalize other accents (e.g., È -> E)
         nfkd_form = unicodedata.normalize('NFKD', name)
         only_ascii = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
         
-        first_char = only_ascii[0] if only_ascii else "A"
+        first_char = only_ascii[0] if only_ascii else DEFAULT_STORAGE_LETTER
         
+        # Only use A-Z; symbols/numbers default to storage letter
         if first_char.isalpha() and 'A' <= first_char <= 'Z':
             return first_char
-        return "A" # Default for numbers/symbols
+        return DEFAULT_STORAGE_LETTER
 
     def _format_duration(self, ms: int) -> str:
         """Formats milliseconds into H:MM:SS."""
@@ -89,6 +100,7 @@ class Manager:
                 "duration": pl_duration_ms
             })
             
+            # Save tracks to DB
             upsert_tracks(self.db, tracks)
             for t in tracks:
                 spotify_track_ids.add(t.id)
@@ -97,14 +109,14 @@ class Manager:
         return spotify_track_ids, playlist_stats
 
     def sync_storage(self):
-        """Main sync loop."""
+        """Main sync loop: Ingests new music, dedupes, and detects manual removals from Spotify."""
         self.ingest_liked_songs()
-        # Removed auto_confirm to ensure user reviews duplicates
         self.deduplicate_storage()
 
         print("\nSyncing storage state...")
         spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
 
+        # Compare Spotify state with DB state to find manual removals
         db_track_ids = set(get_all_active_track_ids(self.db))
         missing_ids = list(db_track_ids - spotify_track_ids)
         
@@ -117,6 +129,7 @@ class Manager:
             mark_tracks_deleted(self.db, missing_ids, trans_id)
             print(f"Recorded DELETE transaction #{trans_id}\n")
 
+        # Print summary table
         total_songs = 0
         total_duration_ms = 0
         print(f"{'Playlist':<10} {'Songs':<8} {'Duration':<12}")
@@ -177,6 +190,7 @@ class Manager:
                 print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
                 self.sp.add_tracks_to_playlist(playlist_id, track_ids)
                 
+                # Update tracks with storage info before DB upsert
                 for track in tracks:
                     track.storage_playlist_id = playlist_id
                     track.add_transaction_id = trans_id
@@ -185,6 +199,7 @@ class Manager:
                 upsert_tracks(self.db, tracks)
             print(f"New tracks recorded in DB (Transaction #{trans_id})")
 
+        # Always clear Liked Songs to treat it as an inbox
         print(f"Cleaning up 'Liked Songs' ({len(liked_tracks)} tracks)...")
         self.sp.remove_liked_songs([t.id for t in liked_tracks])
         print("Ingest complete.")
@@ -194,6 +209,7 @@ class Manager:
         print("Checking for binary duplicates...")
         all_tracks = get_all_active_tracks(self.db)
         
+        # Group by Lead Artist + Song Name
         groups: Dict[Tuple[str, str], List[Track]] = {}
         for track in all_tracks:
             key = (track.artist.lower(), track.name.lower())
@@ -204,15 +220,17 @@ class Manager:
         duplicate_groups = [g for g in groups.values() if len(g) > 1]
         
         to_delete = []
-        to_show = [] # List of (keep, others) tuples
+        to_show = [] # Tracks identified for review
         
         for group in duplicate_groups:
+            # Sort by duration to group similar lengths
             group.sort(key=lambda x: x.duration_ms)
             subgroups: List[List[Track]] = []
             if group:
                 current_subgroup = [group[0]]
                 for i in range(1, len(group)):
-                    if abs(group[i].duration_ms - group[i-1].duration_ms) <= 2000:
+                    # Within defined threshold (e.g. 2s) is considered same audio
+                    if abs(group[i].duration_ms - group[i-1].duration_ms) <= BINARY_DEDUPE_THRESHOLD_MS:
                         current_subgroup.append(group[i])
                     else:
                         subgroups.append(current_subgroup)
@@ -221,6 +239,7 @@ class Manager:
                 
             for sg in subgroups:
                 if len(sg) > 1:
+                    # Preference: Most play history, then oldest added_at
                     sg.sort(key=lambda x: (x.last_played_at is None, x.added_at or datetime.max))
                     keep = sg[0]
                     others = sg[1:]
@@ -231,7 +250,7 @@ class Manager:
             print("No binary duplicates found.")
             return
 
-        # Always list duplicates for user review
+        # List identified duplicates for user confirmation
         print(f"\nFound {len(to_delete)} duplicate tracks across {len(to_show)} song groups:")
         for keep, others in to_show:
             print(f"\n  [KEEP] {keep.artist} - {keep.name} ({self._format_duration(keep.duration_ms)})")
@@ -263,8 +282,9 @@ class Manager:
 
     def _get_root_name(self, name: str) -> str:
         """Strips common version/remix/feat suffixes to find the 'root' song name."""
-        name = re.sub(r'\s*[\[\(](remaster|edit|remix|mix|radio|live|feat|acoustic|version|original|mono|stereo|bonus|20\d\d|single|video).*?[\]\)]', '', name, flags=re.IGNORECASE)
-        name = re.sub(r'\s*-\s*(remix|radio|edit|acoustic|mix|version|feat|original).*$', '', name, flags=re.IGNORECASE)
+        # Using centralized regex keywords for consistency
+        name = re.sub(fr'\s*[\[\(]({ROOT_NAME_FORBIDDEN_KEYWORDS}).*?[\]\)]', '', name, flags=re.IGNORECASE)
+        name = re.sub(fr'\s*-\s*({ROOT_NAME_FORBIDDEN_KEYWORDS}).*$', '', name, flags=re.IGNORECASE)
         return name.strip().lower()
 
     def find_version_duplicates(self):
@@ -274,6 +294,7 @@ class Manager:
         
         groups: Dict[Tuple[str, str], List[Track]] = {}
         for track in all_tracks:
+            # Group by Lead Artist + Root Song Name
             lead_artist = track.artist.split(',')[0].strip().lower()
             root_name = self._get_root_name(track.name)
             if not root_name: continue
@@ -287,6 +308,7 @@ class Manager:
         for key, tracks in groups.items():
             if len(tracks) < 2: continue
             
+            # Filter out pairs already in the allowlist
             filtered_tracks = []
             for i in range(len(tracks)):
                 is_new = True
@@ -305,7 +327,8 @@ class Manager:
             print("No potential versions found to review.")
             return
 
-        review_keys = list(potential_groups.keys())[:20]
+        # Prepare a manageable review session
+        review_keys = list(potential_groups.keys())[:VERSION_REVIEW_GROUP_LIMIT]
         tracks_to_review = []
         session_data = []
         
@@ -350,7 +373,7 @@ class Manager:
             removed_in_group = [tid for tid in expected_ids if tid not in current_ids]
             
             if not kept_in_group:
-                # All removed - restore to review as per request
+                # Safety: If all versions deleted, restore them for a second look
                 restored_groups.append(expected_ids)
             else:
                 if removed_in_group:
@@ -402,7 +425,6 @@ class Manager:
 
         if not restored_groups:
             clear_review_session(self.db)
-            # Clear the review playlist
             self.sp.remove_tracks_from_playlist(review_pl.id, self.sp.get_playlist_tracks_ordered(review_pl.id))
             print("\nReview complete. 'Duplicate Review' playlist cleared.")
         else:
@@ -439,6 +461,7 @@ class Manager:
 
         selected_indices = set()
 
+        # Multi-select album picker
         while True:
             print(f"\n--- {selected_artist['name']} Releases ---")
             for idx, album in enumerate(all_releases, 1):
@@ -584,7 +607,7 @@ class Manager:
         main_tracks = self.sp.get_artist_top_tracks(artist_id)
         selected_track_ids = [t["id"] for t in main_tracks[:main_count]]
         
-        # Discover Peers via ROBOT SCRAPER ONLY
+        # Discover Peers via ROBOT SCRAPER (Bypass API limits)
         print("Discovering peers via Spotify Web Player robot...")
         scraped_peers = self.scraper.get_related_artists(artist_id)
         peer_ids = [p["id"] for p in scraped_peers]
@@ -593,7 +616,6 @@ class Manager:
             print("Robot found no peers on the Spotify web player. Aborting.")
             return
 
-        # Batch fetch profile details (popularity)
         peer_details = []
         for i in range(0, len(peer_ids), 50):
             batch = self.sp.sp.artists(peer_ids[i:i+50])
@@ -603,6 +625,7 @@ class Manager:
             print("Failed to fetch peer details. Aborting.")
             return
 
+        # Midpoint popularity filter
         peer_details.sort(key=lambda x: x["popularity"], reverse=True)
         midpoint_pop = sum(a['popularity'] for a in peer_details) / len(peer_details)
         
@@ -619,13 +642,13 @@ class Manager:
 
         print(f"Found {len(filtered)} peers matching filter '{size_filter}' (Midpoint: {midpoint_pop:.1f}).")
         
+        # Fair selection from peers
         random.shuffle(filtered)
         added_related = 0
         for peer in filtered:
             try:
                 r_tracks = self.sp.get_artist_top_tracks(peer["id"])
                 if r_tracks:
-                    # Take up to per_artist
                     to_take = min(per_artist, len(r_tracks))
                     selected_track_ids.extend([t["id"] for t in r_tracks[:to_take]])
                     added_related += to_take
@@ -648,31 +671,30 @@ class Manager:
         print(f"\nRadio playlist '{radio_name}' created with {len(selected_track_ids)} tracks.")
 
     def find_new_music(self):
-        """Discovers new albums from artists the user already likes (>= 15 listened tracks)."""
-        print("Searching for artists you like (>= 15 listened songs)...")
-        # We query for artist name AND we need to find their ID reliably
+        """Discovers new albums from artists the user already likes (>= qualifying min tracks)."""
+        print(f"Searching for artists you like (>= {FINDNEW_QUALIFY_MIN_TRACKS} listened songs)...")
         cur = self.db.cursor()
         cur.execute("""
             SELECT artist, id FROM track 
             WHERE last_played_at IS NOT NULL AND is_deleted = 0
             GROUP BY artist
-            HAVING COUNT(*) >= 15
-        """)
+            HAVING COUNT(*) >= ?
+        """, (FINDNEW_QUALIFY_MIN_TRACKS,))
         qualifying_rows = cur.fetchall()
         
         if not qualifying_rows:
-            print("No artists found with at least 15 listened tracks.")
+            print(f"No artists found with at least {FINDNEW_QUALIFY_MIN_TRACKS} listened tracks.")
             return
 
         print(f"Found {len(qualifying_rows)} artists to check.")
         
         current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
         now = datetime.now()
-        six_months_ago = now - timedelta(days=180)
+        cooldown_threshold = now - timedelta(days=FINDNEW_ARTIST_COOLDOWN_DAYS)
 
         for artist_name, sample_track_id in qualifying_rows:
             last_check = get_artist_last_check(self.db, artist_name)
-            if last_check and last_check > six_months_ago:
+            if last_check and last_check > cooldown_threshold:
                 continue
 
             print(f"\n--- Checking artist: {artist_name} ---")
@@ -682,19 +704,15 @@ class Manager:
                 track_info = self.sp.sp.track(sample_track_id)
                 artist_id = track_info['artists'][0]['id']
                 real_artist_name = track_info['artists'][0]['name']
-                if real_artist_name.lower() != artist_name.lower():
-                    print(f"  Note: Resolved name '{real_artist_name}' for DB entry '{artist_name}'")
             except Exception as e:
                 print(f"  Error resolving artist ID: {e}")
                 continue
             
-            # 3. Get all albums from Spotify
             all_albums = self.sp.get_artist_albums(artist_id, types=["album"])
             if not all_albums:
                 set_artist_checked(self.db, artist_name)
                 continue
 
-            # 4. Get handled albums (in DB or IGNORED)
             handled_album_names = get_handled_albums(self.db, artist_name)
             
             new_albums = []
@@ -707,15 +725,14 @@ class Manager:
                 continue
 
             print(f"  Found {len(new_albums)} potentially new albums.")
-            print(f"  Existing catalog: {', '.join(sorted(list(handled_album_names))[:10])}...")
 
             for album in new_albums:
                 print(f"\n  [NEW ALBUM] ({album.get('release_date', '0000')[:4]}) {album['name']}")
                 
-                # Similarity check
+                # Check for high similarity to existing catalog
                 for handled in handled_album_names:
                     similarity = difflib.SequenceMatcher(None, album["name"].lower(), handled.lower()).ratio()
-                    if similarity > 0.8:
+                    if similarity > FINDNEW_ALBUM_SIMILARITY_THRESHOLD:
                         print(f"  WARNING: Name is very similar to existing album: '{handled}' (Similarity: {similarity:.2f})")
 
                 while True:
@@ -729,13 +746,12 @@ class Manager:
                             print(f"      {idx:2}. {t.name}")
                         continue
                     elif choice == 'y':
-                        # Add tracks to storage
+                        # Ingest the entire album
                         tracks = self.sp.get_album_tracks(album["id"], album["name"])
                         if tracks:
                             print(f"    Adding {len(tracks)} tracks to storage...")
                             trans_id = create_transaction(self.db, "ADD", len(tracks), f"findnew: {real_artist_name} - {album['name']}")
                             
-                            # Group by letter
                             tracks_by_letter = {}
                             for t in tracks:
                                 letter = self._get_storage_letter(t.name)
@@ -884,7 +900,7 @@ class Manager:
               f"with deleted songs {self._format_duration(stats['full_listening_time_ms'])} | "
               f"Avg plays: {stats['avg_plays']:.2f}")
         
-        print(f"Momentum: {self._format_duration(stats['momentum_ms'])} listened in last 7 days.")
+        print(f"Momentum: {self._format_duration(stats['momentum_ms'])} listened in last {MOMENTUM_WINDOW_DAYS} days.")
         
         if stats['oldest_waiting_at']:
             print(f"Queue: Oldest song waiting since {stats['oldest_waiting_at'].strftime('%Y-%m-%d %H:%M')}.")
@@ -905,20 +921,16 @@ class Manager:
         else: # default
             listened_ids = self.process_listened_tracks(active_playlist_name)
             if not listened_ids:
-                # Check if playlist is not empty AND we can't determine playback
                 current_count = len(self.sp.get_playlist_tracks_ordered(active_playlist.id))
                 if current_count > 0 and self._get_current_track_id() is None:
-                    # process_listened_tracks already printed the error
                     return
 
-        # Handle 'Phone Listening' history
         if listened_ids:
             self._update_phone_listening(listened_ids, phone_playlist_name)
 
         target_ms = int(target_hours * 3600 * 1000)
 
         print("Fetching current active playlist state...")
-        # Get full track objects so we can see artists for lock initialization
         current_tracks_on_spotify = self.sp.get_playlist_tracks(active_playlist.id)
         current_track_ids_set = set(t.id for t in current_tracks_on_spotify)
 
@@ -934,32 +946,30 @@ class Manager:
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
         
-        # 1. Fetch large pool of oldest tracks (Increased to 30,000 to cover entire library)
-        print("Gathering candidate tracks from library (Oldest first)...")
-        pool = get_least_recently_played_tracks(self.db, limit=30000)
+        # Queue-Based Spreading Algorithm
+        print(f"Gathering candidate tracks from library (Oldest first)...")
+        pool = get_least_recently_played_tracks(self.db, limit=REFILL_CANDIDATE_POOL_SIZE)
         
-        # 2. Setup Artist Locks based on current playlist tail
-        # Artists in the last 10 songs of the current playlist are already locked
-        artist_locks = {} # artist_name -> index at which they become available
+        artist_locks = {} 
         current_fill_index = 0
         
-        tail_10 = current_tracks_on_spotify[-10:]
-        for i, t in enumerate(tail_10):
-            dist_from_end = len(tail_10) - i
-            lock_remaining = 10 - dist_from_end
+        # Initial locks based on what's currently playing/waiting
+        tail_window = current_tracks_on_spotify[-REFILL_ARTIST_LOCK_WINDOW:]
+        for i, t in enumerate(tail_window):
+            dist_from_end = len(tail_window) - i
+            lock_remaining = REFILL_ARTIST_LOCK_WINDOW - dist_from_end
             if lock_remaining > 0:
                 artists = [a.strip() for a in t.artist.split(',')]
                 for a in artists:
                     artist_locks[a] = max(artist_locks.get(a, 0), lock_remaining)
 
-        # 3. Selection Strategy: Absolute Oldest first with 10-song spreading
         to_add_ids = []
         added_play_counts = []
         added_duration = 0
         unique_artists_added = set()
         skipped_locked_count = 0
         
-        print("Selecting tracks using Time-Queue with Spreading (10-song window)...")
+        print(f"Selecting tracks using Time-Queue with Spreading ({REFILL_ARTIST_LOCK_WINDOW}-song window)...")
         for track in pool:
             if added_duration >= needed_ms:
                 break
@@ -967,7 +977,6 @@ class Manager:
             if track.id in current_track_ids_set:
                 continue
                 
-            # Check if any artist on this track is locked
             track_artists = [a.strip() for a in track.artist.split(',')]
             is_locked = any(artist_locks.get(a, 0) > current_fill_index for a in track_artists)
             
@@ -975,21 +984,18 @@ class Manager:
                 skipped_locked_count += 1
                 continue
                 
-            # Track is available!
             to_add_ids.append(track.id)
             added_play_counts.append(track.play_count)
             added_duration += track.duration_ms
             
-            # Increment fill index and update locks
             current_fill_index += 1
             for a in track_artists:
-                artist_locks[a] = current_fill_index + 10
+                artist_locks[a] = current_fill_index + REFILL_ARTIST_LOCK_WINDOW
                 unique_artists_added.add(a)
 
         if to_add_ids:
             print(f"Selected {len(to_add_ids)} tracks from {len(unique_artists_added)} different artists. (Skipped {skipped_locked_count} locked tracks)")
             
-            # Report selection statistics
             if added_play_counts:
                 low = min(added_play_counts)
                 high = max(added_play_counts)
@@ -1004,23 +1010,21 @@ class Manager:
         else:
             print(f"Warning: Could not find any tracks to add. (Processed {len(pool)} candidates, skipped {skipped_locked_count} due to locks)")
 
-        # Final Dashboard
         self._display_dashboard()
 
     def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
-        """Adds tracks to the specified phone history playlist if it's shorter than 100 hours."""
+        """Adds tracks to the specified phone history playlist if it's shorter than configured capacity."""
         pl = self.sp.get_active_playlist(phone_playlist_name)
         
-        # Check current duration efficiently
         print(f"Checking '{phone_playlist_name}' capacity...")
         current_ms = self.sp.get_playlist_duration_ms(pl.id)
         
-        limit_ms = 100 * 3600 * 1000
+        limit_ms = int(PHONE_PLAYLIST_CAPACITY_HOURS * 3600 * 1000)
         if current_ms < limit_ms:
             print(f"  Adding {len(track_ids)} tracks to history...")
             self.sp.add_tracks_to_playlist(pl.id, track_ids)
         else:
-            print(f"  '{phone_playlist_name}' is full (>= 100 hours). Skipping history update.")
+            print(f"  '{phone_playlist_name}' is full (>= {PHONE_PLAYLIST_CAPACITY_HOURS} hours). Skipping history update.")
 
     def list_adds(self):
         transactions = [t for t in list_transactions(self.db, "ADD")]
