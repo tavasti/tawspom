@@ -14,7 +14,7 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
     - Numbers and Symbols: Default to storage playlist `A`.
 - **Sync Process**:
     1. **Ingest**: Move all "Liked Songs" to appropriate A-Z playlists.
-    2. **Deduplicate**: Remove exact binary duplicates.
+    2. **Deduplicate**: Identify and list potential duplicates for user review.
     3. **Cleanup**: Remote tracks from "Liked Songs" after successful storage.
     4. **Manual Removal Tracking**: If a track is deleted from an A-Z playlist on Spotify, it is marked as `is_deleted` in the local DB during the next sync.
 
@@ -29,6 +29,15 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 ### 3.1 The "Active" Playlist (Refill)
 The primary listening source is a configurable rolling window (default 12 hours).
 - **Configuration**: Playlist name is set via `ACTIVE_PLAYLIST_NAME` in `.env` (default: "My Active Music").
+- **Library Dashboard**: At the end of every refill, a dashboard displays:
+    - **Counts**: Total active tracks, total duration, and deleted tracks.
+    - **Coverage**: Number of "Never Listened" tracks and overall Library Coverage %.
+    - **History**: 
+        - **Library listening time**: Cumulative listening for current (active) songs.
+        - **with deleted songs**: Absolute lifetime listening including removed tracks.
+        - **Avg plays**: Average play count per track.
+    - **Momentum**: Total time listened in the last 7 days.
+    - **Queue Health**: Date of the oldest song waiting in the queue and top 3 artists currently at the front of the queue.
 - **Refill Logic (Time-Queue with Spreading)**:
     - **Oldest First**: Candidate tracks are fetched in absolute order of their `last_played_at` date (ascending).
     - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are **locked for the next 10 tracks**. 
@@ -49,45 +58,7 @@ The primary listening source is a configurable rolling window (default 12 hours)
 ---
 
 ## 4. Deduplication
-### 4.1 Binary Deduplication
-- Identifies tracks with the same Artist + Name and a duration within **2 seconds** of each other.
-- Automatically keeps the version with the most play history or the oldest `added_at` date.
-
-### 4.2 Semantic Deduplication (findversions)
-- **Root Name Logic**: Uses regex to strip suffixes like `(Remastered)`, `[Live]`, `- Edit`, `feat. X`.
-- **Bridge Workflow**:
-    1. Potential duplicates are moved to a "Duplicate Review" playlist.
-    2. The user listens and deletes the versions they don't want.
-    3. `processversions` deletes the missing tracks from storage and adds the remaining ones to a `duplicate_allowlist` so they aren't flagged again.
-    4. **Safety**: If a user accidentally deletes ALL versions of a song in the review playlist, the system restores them all to the playlist for a second chance.
-
----
-
-## 5. Discovery Tools
-### 5.1 Artist Radio (artistradio)
-- **Discovery Engine**: Uses a **Headless Robot (Playwright)** to scrape the "Fans Also Like" section from the Spotify Web Player.
-- **Filtering**:
-    - Calculates the midpoint popularity of the discovered group.
-    - Supports `--filter`: `big` (above midpoint), `small` (below midpoint), or `both`.
-- **Scalability**: No total song limit. Takes `--per-artist` tracks from **every** peer found.
-- **Selection**: Uses Round-Robin to ensure every discovered artist is represented before taking a second song from any one artist.
-
-### 5.2 Deep Discovery (findnew)
-- **Targeting**: Checks artists where the user has listened to at least **15 songs**.
-- **Cooldown**: Artists are only checked once every **6 months** (stored in `artist_checks`).
-- **Precision**: 
-    - Resolves the exact Spotify Artist ID using existing tracks from the DB to prevent name collisions.
-    - **Fuzzy Matching**: Flags new albums if their name is highly similar (>80% match) to albums already in the catalog.
-- **Interface**:
-    - Displays existing catalog for context.
-    - Interactive options: 
-        - `[y]es`: Add all tracks from the album to A-Z storage.
-        - `[n]o`: Skip for now.
-        - `[l]ist`: Show tracks within the album before deciding.
-        - `[d]on't ask again`: Permanently ignore this album.
-        - `[q]uit`: Exit the command.
-
----
+...
 
 ## 6. Technical Specifications
 - **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, and `handled_albums`.
@@ -100,3 +71,4 @@ The primary listening source is a configurable rolling window (default 12 hours)
     - `LASTFM_API_KEY`
     - `ACTIVE_PLAYLIST_NAME` (Optional)
     - `PHONE_PLAYLIST_NAME` (Optional)
+    - `DB_PATH` (Optional)

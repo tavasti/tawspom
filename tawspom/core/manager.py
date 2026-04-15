@@ -19,7 +19,7 @@ from tawspom.core.db import (
     add_active_tracks, remove_active_tracks, get_tracked_active_ids,
     get_tracks_by_ids, get_all_active_tracks, get_playlist_track_count,
     add_to_duplicate_allowlist, is_duplicate_allowed, save_review_session,
-    get_review_session, clear_review_session,
+    get_review_session, clear_review_session, get_library_stats,
     get_artist_last_check, set_artist_checked, get_handled_albums, add_to_ignored_albums
 )
 from tawspom.models import Track, Playlist, Transaction
@@ -99,7 +99,8 @@ class Manager:
     def sync_storage(self):
         """Main sync loop."""
         self.ingest_liked_songs()
-        self.deduplicate_storage(auto_confirm=True)
+        # Removed auto_confirm to ensure user reviews duplicates
+        self.deduplicate_storage()
 
         print("\nSyncing storage state...")
         spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
@@ -188,9 +189,9 @@ class Manager:
         self.sp.remove_liked_songs([t.id for t in liked_tracks])
         print("Ingest complete.")
 
-    def deduplicate_storage(self, auto_confirm: bool = False):
+    def deduplicate_storage(self):
         """Identifies and removes duplicate tracks (same artist/name/duration)."""
-        print("Checking for duplicates...")
+        print("Checking for binary duplicates...")
         all_tracks = get_all_active_tracks(self.db)
         
         groups: Dict[Tuple[str, str], List[Track]] = {}
@@ -203,6 +204,8 @@ class Manager:
         duplicate_groups = [g for g in groups.values() if len(g) > 1]
         
         to_delete = []
+        to_show = [] # List of (keep, others) tuples
+        
         for group in duplicate_groups:
             group.sort(key=lambda x: x.duration_ms)
             subgroups: List[List[Track]] = []
@@ -221,25 +224,27 @@ class Manager:
                     sg.sort(key=lambda x: (x.last_played_at is None, x.added_at or datetime.max))
                     keep = sg[0]
                     others = sg[1:]
-                    
-                    if not auto_confirm:
-                        print(f"\nFound duplicate group for '{keep.artist} - {keep.name}':")
-                        print(f"  [KEEP] {keep.id} (Added: {keep.added_at}, Played: {keep.last_played_at})")
-                        for other in others:
-                            print(f"  [DEL ] {other.id} (Added: {other.added_at}, Played: {other.last_played_at})")
-                    
+                    to_show.append((keep, others))
                     to_delete.extend(others)
 
         if not to_delete:
             print("No binary duplicates found.")
             return
 
-        if not auto_confirm:
-            print(f"\nProceed with removing {len(to_delete)} duplicate tracks? [y/N]: ")
-            confirm = input().lower()
-            if confirm != 'y':
-                print("Operation cancelled.")
-                return
+        # Always list duplicates for user review
+        print(f"\nFound {len(to_delete)} duplicate tracks across {len(to_show)} song groups:")
+        for keep, others in to_show:
+            print(f"\n  [KEEP] {keep.artist} - {keep.name} ({self._format_duration(keep.duration_ms)})")
+            print(f"         ID: {keep.id} | Added: {keep.added_at} | Played: {keep.last_played_at}")
+            for other in others:
+                print(f"  [DEL ] {other.artist} - {other.name} ({self._format_duration(other.duration_ms)})")
+                print(f"         ID: {other.id} | Added: {other.added_at} | Played: {other.last_played_at}")
+
+        print(f"\nProceed with removing these {len(to_delete)} duplicates? [y/N]: ")
+        confirm = input().lower()
+        if confirm != 'y':
+            print("Operation cancelled.")
+            return
 
         print(f"Removing {len(to_delete)} duplicate tracks...")
         trans_id = create_transaction(self.db, "DELETE", len(to_delete), "Deduplication run")
@@ -867,6 +872,28 @@ class Manager:
         remove_active_tracks(self.db, removed_ids)
         print(f"Manual removals processed. Transaction #{trans_id}")
 
+    def _display_dashboard(self):
+        """Displays the comprehensive library dashboard."""
+        stats = get_library_stats(self.db)
+        print("\n" + "="*30 + " LIBRARY STATUS " + "="*30)
+        print(f"Tracks: {stats['total_active']:,} Active ({self._format_duration(stats['total_duration_ms'])}) | "
+              f"{stats['total_deleted']} Deleted | "
+              f"{stats['never_played']:,} Never Listened ({stats['coverage_pct']:.1f}% Coverage)")
+        
+        print(f"History: Library listening time: {self._format_duration(stats['total_history_ms'])}, "
+              f"with deleted songs {self._format_duration(stats['full_listening_time_ms'])} | "
+              f"Avg plays: {stats['avg_plays']:.2f}")
+        
+        print(f"Momentum: {self._format_duration(stats['momentum_ms'])} listened in last 7 days.")
+        
+        if stats['oldest_waiting_at']:
+            print(f"Queue: Oldest song waiting since {stats['oldest_waiting_at'].strftime('%Y-%m-%d %H:%M')}.")
+        
+        if stats['top_waiting_artists']:
+            top_arr = [f"{a} ({c})" for a, c in stats['top_waiting_artists']]
+            print(f"Top Waiting Artists: {', '.join(top_arr)}")
+        print("="*76 + "\n")
+
     def refill_active_playlist(self, active_playlist_name: str, target_hours: float, mode: str = "default", phone_playlist_name: str = "Phone Listening"):
         listened_ids = []
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
@@ -902,6 +929,7 @@ class Manager:
         needed_ms = target_ms - current_duration_ms
         if needed_ms <= 0:
             print(f"Active playlist already has {current_duration_ms / 3600000:.1f} hours.")
+            self._display_dashboard()
             return
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
@@ -961,7 +989,7 @@ class Manager:
         if to_add_ids:
             print(f"Selected {len(to_add_ids)} tracks from {len(unique_artists_added)} different artists. (Skipped {skipped_locked_count} locked tracks)")
             
-            # Report statistics
+            # Report selection statistics
             if added_play_counts:
                 low = min(added_play_counts)
                 high = max(added_play_counts)
@@ -975,6 +1003,9 @@ class Manager:
             print("Refill complete.")
         else:
             print(f"Warning: Could not find any tracks to add. (Processed {len(pool)} candidates, skipped {skipped_locked_count} due to locks)")
+
+        # Final Dashboard
+        self._display_dashboard()
 
     def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
         """Adds tracks to the specified phone history playlist if it's shorter than 100 hours."""
