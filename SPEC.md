@@ -90,8 +90,8 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
     - Resolves the exact Spotify Artist ID using existing tracks from the DB to prevent name collisions.
     - **Fuzzy Matching**: Flags new albums if their name is highly similar (exceeding `FINDNEW_ALBUM_SIMILARITY_THRESHOLD`, Default: 0.8) to albums already in the catalog.
 - **Interface**:
-    - Displays existing catalog for context.
-    - Interactive options: 
+    - **Artist Level**: For artists with new albums, asks for high-level decision: `[y]es` (review individually), `[n]o` (skip artist), `[a]ll` (ingest all new albums), `[d]on't ask for 6mo`, or `[q]uit`.
+    - **Album Level**: 
         - `[y]es`: Add all tracks from the album to A-Z storage.
         - `[n]o`: Skip for now.
         - `[l]ist`: Show tracks within the album before deciding.
@@ -105,7 +105,7 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - **Batching**: 
     - Playlists: `SPOTIFY_PLAYLIST_BATCH_SIZE` (Default: 100).
     - Liked Songs: `SPOTIFY_LIKED_SONGS_BATCH_SIZE` (Default: 20).
-- **API Wrapper**: A centralized `_call_with_retry` function handles connection errors and rate limits using `SPOTIFY_MAX_RETRIES` (Default: 3) and `SPOTIFY_RETRY_DELAY` (Default: 2s).
+- **API Wrapper**: A centralized `_call_with_retry` function handles connection errors and rate limits using `SPOTIFY_MAX_RETRIES` (Attempt 3) and `SPOTIFY_RETRY_DELAY` (Delay 2s).
 - **API Timeout**: Configured via `SPOTIFY_API_TIMEOUT` (Default: 10s).
 - **Environment**: Configuration via `.env` file.
     - `SPOTIPY_CLIENT_ID`

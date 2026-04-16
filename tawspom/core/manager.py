@@ -726,6 +726,60 @@ class Manager:
 
             print(f"  Found {len(new_albums)} potentially new albums.")
 
+            # High-level artist confirmation
+            skip_artist = False
+            while True:
+                print(f"  Process {real_artist_name}? [y]es (one by one) / [n]o (skip now) / [a]ll (add {len(new_albums)} albums) / [d]on't ask for 6mo / [q]uit")
+                artist_choice = input("  >> ").lower().strip()
+                if artist_choice == 'y':
+                    break
+                elif artist_choice == 'n':
+                    skip_artist = True
+                    break
+                elif artist_choice == 'a':
+                    print(f"    Bulk adding {len(new_albums)} albums for {real_artist_name}...")
+                    all_tracks_to_add = []
+                    for album in new_albums:
+                        album_tracks = self.sp.get_album_tracks(album["id"], album["name"])
+                        all_tracks_to_add.extend(album_tracks)
+                    
+                    if all_tracks_to_add:
+                        trans_id = create_transaction(self.db, "ADD", len(all_tracks_to_add), f"findnew-bulk: {real_artist_name}")
+                        tracks_by_letter = {}
+                        for t in all_tracks_to_add:
+                            letter = self._get_storage_letter(t.name)
+                            if letter not in tracks_by_letter: tracks_by_letter[letter] = []
+                            tracks_by_letter[letter].append(t)
+                        
+                        for letter, letter_tracks in tracks_by_letter.items():
+                            playlist_id = current_playlists.get(letter)
+                            if not playlist_id:
+                                playlist_id = self.sp.create_playlist(letter).id
+                                current_playlists[letter] = playlist_id
+                            
+                            tids = [t.id for t in letter_tracks]
+                            self.sp.add_tracks_to_playlist(playlist_id, tids)
+                            for t in letter_tracks:
+                                t.storage_playlist_id = playlist_id
+                                t.add_transaction_id = trans_id
+                                t.added_at = now
+                            upsert_tracks(self.db, letter_tracks)
+                        print(f"    Bulk add complete. Transaction #{trans_id}")
+                    skip_artist = True # We are done with this artist
+                    break
+                elif artist_choice == 'd':
+                    set_artist_checked(self.db, artist_name)
+                    skip_artist = True
+                    break
+                elif artist_choice == 'q':
+                    print("Quitting findnew.")
+                    return
+                else:
+                    print("  Invalid choice.")
+
+            if skip_artist:
+                continue
+
             for album in new_albums:
                 print(f"\n  [NEW ALBUM] ({album.get('release_date', '0000')[:4]}) {album['name']}")
                 
