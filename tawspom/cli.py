@@ -4,6 +4,9 @@ import os
 from tawspom.core.db import init_db
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.manager import Manager
+from tawspom.core.constants import (
+    DEFAULT_REFILL_HOURS, RADIO_DEFAULT_MAIN_COUNT, RADIO_DEFAULT_PER_ARTIST
+)
 
 # Configurable playlist names with defaults
 ACTIVE_PLAYLIST_NAME = os.getenv("ACTIVE_PLAYLIST_NAME", "My Active Music")
@@ -26,13 +29,15 @@ def main():
     subparsers.add_parser("deduplicate", help="Find and remove binary duplicates from storage")
     subparsers.add_parser("findversions", help="Find potential versions of songs and put in 'Duplicate Review' playlist")
     subparsers.add_parser("processversions", help="Process the 'Duplicate Review' playlist and delete removed tracks")
-    subparsers.add_parser("findnew", help="Find new albums from artists you have listened to (>= 15 songs)")
+    subparsers.add_parser("findnew", help="Find new albums from artists you have listened to")
 
     # Radio
     radio_parser = subparsers.add_parser("artistradio", help="Create a custom artist radio playlist")
     radio_parser.add_argument("name", help="Name of the artist")
-    radio_parser.add_argument("--main-count", type=int, default=10, help="Number of songs from the main artist (default: 10)")
-    radio_parser.add_argument("--per-artist", type=int, default=5, help="Number of songs to take from EACH discovered related artist (default: 5)")
+    radio_parser.add_argument("--main-count", type=int, default=RADIO_DEFAULT_MAIN_COUNT, 
+                              help=f"Number of songs from the main artist (default: {RADIO_DEFAULT_MAIN_COUNT})")
+    radio_parser.add_argument("--per-artist", type=int, default=RADIO_DEFAULT_PER_ARTIST, 
+                              help=f"Number of songs to take from EACH discovered related artist (default: {RADIO_DEFAULT_PER_ARTIST})")
     radio_parser.add_argument("--filter", choices=["big", "small", "both"], default="both", 
                               help="Filter related artists by size (big = top 50%, small = bottom 50%, both = all)")
 
@@ -67,7 +72,8 @@ def main():
 
     # Refill active playlist
     refill_parser = subparsers.add_parser("refill", help="Refill the active playlist")
-    refill_parser.add_argument("--hours", type=float, default=12.0, help="Target duration in hours (default: 12)")
+    refill_parser.add_argument("--hours", type=float, default=DEFAULT_REFILL_HOURS, 
+                              help=f"Target duration in hours (default: {DEFAULT_REFILL_HOURS})")
     
     refill_mode = refill_parser.add_mutually_exclusive_group()
     refill_mode.add_argument("--flush", action="store_true", help="Flush current playlist and refill from scratch")

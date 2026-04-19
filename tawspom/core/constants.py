@@ -36,6 +36,12 @@ FINDNEW_ARTIST_COOLDOWN_DAYS = 180
 # Similarity threshold for flagging existing albums in findnew (0.0 to 1.0)
 FINDNEW_ALBUM_SIMILARITY_THRESHOLD = 0.8
 
+# --- Artist Radio ---
+# Default number of tracks from the main artist
+RADIO_DEFAULT_MAIN_COUNT = 10
+# Default tracks per related artist
+RADIO_DEFAULT_PER_ARTIST = 5
+
 # --- Spotify API Constraints ---
 # Maximum items per playlist edit (Spotify limit: 100)
 SPOTIFY_PLAYLIST_BATCH_SIZE = 100
