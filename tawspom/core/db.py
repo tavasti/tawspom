@@ -3,12 +3,8 @@ import os
 from typing import List, Optional, Tuple, Set, Dict
 from datetime import datetime, timedelta
 from tawspom.models import Track, Transaction
-from tawspom.core.constants import (
-    MOMENTUM_WINDOW_DAYS, DASHBOARD_OLD_POOL_SIZE,
-    FINDNEW_QUALIFY_MIN_TRACKS
-)
 
-DB_PATH = os.getenv("DB_PATH", os.path.expanduser("~/.local/share/tawspom/tawspom.sqlite3"))
+DB_PATH = os.path.expanduser("~/.local/share/tawspom/tawspom.sqlite3")
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -78,7 +74,6 @@ def init_db():
         )
     """)
 
-    # New tables for 'findnew' feature
     cur.execute("""
         CREATE TABLE IF NOT EXISTS artist_checks (
             artist_name TEXT PRIMARY KEY,
@@ -119,6 +114,17 @@ def init_db():
 
     conn.commit()
     return conn
+
+def set_meta(conn, key: str, value: str):
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+def get_meta(conn, key: str) -> Optional[str]:
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 def create_transaction(conn, trans_type: str, count: int, description: str, cancels_id: Optional[int] = None) -> int:
     cur = conn.cursor()
@@ -288,6 +294,14 @@ def add_active_tracks(conn, track_ids: List[str]):
         cur.execute("INSERT OR IGNORE INTO active_tracks (track_id, added_at) VALUES (?, ?)", (tid, now))
     conn.commit()
 
+def reset_active_tracks(conn, track_ids: List[str]):
+    """Clears active_tracks and replaces it with the provided list."""
+    cur = conn.cursor()
+    cur.execute("DELETE FROM active_tracks")
+    now = datetime.now().isoformat()
+    cur.executemany("INSERT INTO active_tracks (track_id, added_at) VALUES (?, ?)", [(tid, now) for tid in track_ids])
+    conn.commit()
+
 def remove_active_tracks(conn, track_ids: List[str]):
     if not track_ids: return
     cur = conn.cursor()
@@ -345,59 +359,70 @@ def clear_review_session(conn):
 def get_library_stats(conn) -> Dict:
     cur = conn.cursor()
     
-    # Basic counts
+    # 1. Basic counts
     cur.execute("SELECT COUNT(*), SUM(duration_ms) FROM track WHERE is_deleted = 0")
-    total_active, total_duration_ms = cur.fetchone()
-    total_duration_ms = total_duration_ms or 0
+    total_active, total_ms = cur.fetchone()
     
     cur.execute("SELECT COUNT(*) FROM track WHERE is_deleted = 1")
     total_deleted = cur.fetchone()[0]
     
-    cur.execute("SELECT COUNT(*) FROM track WHERE last_played_at IS NULL AND is_deleted = 0")
+    # 2. Coverage
+    cur.execute("SELECT COUNT(*) FROM track WHERE is_deleted = 0 AND last_played_at IS NULL")
     never_played = cur.fetchone()[0]
+    coverage_pct = ((total_active - never_played) / total_active * 100) if total_active > 0 else 0
     
-    # Play statistics (Active only)
-    cur.execute("SELECT SUM(play_count), AVG(play_count), SUM(play_count * duration_ms) FROM track WHERE is_deleted = 0")
-    total_plays, avg_plays, total_history_ms = cur.fetchone()
-    total_plays = total_plays or 0
+    # 3. History
+    cur.execute("SELECT SUM(play_count * duration_ms) FROM track WHERE is_deleted = 0")
+    active_history_ms = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT SUM(play_count * duration_ms), AVG(play_count) FROM track")
+    full_history_ms, avg_plays = cur.fetchone()
+    full_history_ms = full_history_ms or 0
     avg_plays = avg_plays or 0
-    total_history_ms = total_history_ms or 0
     
-    # Full history (Including deleted tracks)
-    cur.execute("SELECT SUM(play_count * duration_ms) FROM track")
-    full_listening_time_ms = cur.fetchone()[0] or 0
-    
-    # Momentum (Configurable window)
-    momentum_threshold = (datetime.now() - timedelta(days=MOMENTUM_WINDOW_DAYS)).isoformat()
-    cur.execute("SELECT SUM(duration_ms) FROM track WHERE last_played_at > ? AND is_deleted = 0", (momentum_threshold,))
+    # 4. Momentum (last 7 days)
+    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    cur.execute("SELECT SUM(duration_ms) FROM track WHERE last_played_at > ?", (cutoff,))
     momentum_ms = cur.fetchone()[0] or 0
     
-    # Queue Lag
-    cur.execute("SELECT MIN(last_played_at) FROM track WHERE last_played_at IS NOT NULL AND is_deleted = 0")
-    oldest_waiting_at = cur.fetchone()[0]
+    # 5. Queue Health
+    cur.execute("SELECT last_played_at FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC LIMIT 1")
+    oldest_row = cur.fetchone()
+    oldest_waiting = datetime.fromisoformat(oldest_row[0]) if (oldest_row and oldest_row[0]) else None
     
-    # Top Waiting Artists (Configurable pool size)
-    cur.execute(f"""
-        SELECT artist, COUNT(*) as c FROM (
-            SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT {DASHBOARD_OLD_POOL_SIZE}
-        ) GROUP BY artist ORDER BY c DESC LIMIT 3
+    cur.execute("""
+        SELECT artist, COUNT(*) as c 
+        FROM (SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT 1000)
+        GROUP BY artist ORDER BY c DESC LIMIT 3
     """)
-    top_waiting_artists = cur.fetchall()
-    
+    top_waiting = cur.fetchall()
+
     return {
-        "total_active": total_active,
-        "total_duration_ms": total_duration_ms,
-        "total_deleted": total_deleted,
-        "never_played": never_played,
-        "coverage_pct": (1 - never_played / total_active) * 100 if total_active > 0 else 0,
-        "total_plays": total_plays,
-        "avg_plays": avg_plays,
-        "total_history_ms": total_history_ms,
-        "full_listening_time_ms": full_listening_time_ms,
-        "momentum_ms": momentum_ms,
-        "oldest_waiting_at": datetime.fromisoformat(oldest_waiting_at) if oldest_waiting_at else None,
-        "top_waiting_artists": top_waiting_artists
+        'total_active': total_active,
+        'total_duration_ms': total_ms or 0,
+        'total_deleted': total_deleted,
+        'never_played': never_played,
+        'coverage_pct': coverage_pct,
+        'total_history_ms': active_history_ms,
+        'full_listening_time_ms': full_history_ms,
+        'avg_plays': avg_plays,
+        'momentum_ms': momentum_ms,
+        'oldest_waiting_at': oldest_waiting,
+        'top_waiting_artists': top_waiting
     }
+
+# --- Helper functions for 'findnew' ---
+
+def get_listened_artist_data(conn, min_count: int) -> List[Tuple[str, str]]:
+    """Returns list of artist names where user has listened to >= min_count songs."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT artist FROM track 
+        WHERE last_played_at IS NOT NULL AND is_deleted = 0
+        GROUP BY artist
+        HAVING COUNT(*) >= ?
+    """, (min_count,))
+    return [row[0] for row in cur.fetchall()]
 
 def get_artist_last_check(conn, artist_name: str) -> Optional[datetime]:
     cur = conn.cursor()

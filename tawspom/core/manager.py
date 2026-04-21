@@ -20,7 +20,8 @@ from tawspom.core.db import (
     get_tracks_by_ids, get_all_active_tracks, get_playlist_track_count,
     add_to_duplicate_allowlist, is_duplicate_allowed, save_review_session,
     get_review_session, clear_review_session, get_library_stats,
-    get_artist_last_check, set_artist_checked, get_handled_albums, add_to_ignored_albums
+    get_artist_last_check, set_artist_checked, get_handled_albums, add_to_ignored_albums,
+    reset_active_tracks, set_meta
 )
 from tawspom.models import Track, Playlist, Transaction
 from tawspom.core.constants import (
@@ -571,6 +572,7 @@ class Manager:
             print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
             self.sp.add_tracks_to_playlist(playlist_id, track_ids)
             
+            # Update tracks with storage info before DB upsert
             for track in tracks:
                 track.storage_playlist_id = playlist_id
                 track.add_transaction_id = trans_id
@@ -627,7 +629,7 @@ class Manager:
 
         # Midpoint popularity filter
         peer_details.sort(key=lambda x: x["popularity"], reverse=True)
-        midpoint_pop = sum(a['popularity'] for a in peer_details) / len(peer_details)
+        midpoint_pop = statistics.mean(a['popularity'] for a in peer_details)
         
         if size_filter == "big":
             filtered = [a for a in peer_details if a['popularity'] >= midpoint_pop]
@@ -850,40 +852,63 @@ class Manager:
             return playback["item"]["id"]
         return None
 
-    def process_listened_tracks(self, active_playlist_name: str) -> List[str]:
-        """Identifies listened tracks, marks them in DB, and returns them."""
+    def process_listened_tracks(self, active_playlist_name: str) -> Tuple[List[str], Playlist]:
+        """Identifies listened tracks, marks them in DB, and returns them along with the active playlist used."""
         active_playlist = self.sp.get_active_playlist(active_playlist_name)
-        if not active_playlist: return []
+        if not active_playlist: return [], None
 
         track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
-        if not track_ids:
-            return []
-
+        
         playback = self.sp.get_current_playback()
         if not playback or not playback.get("item"):
             print(f"Error: Nothing is currently playing. Start playing '{active_playlist_name}' first, or use --flush.")
-            return []
+            return [], active_playlist
 
         current_track_id = playback["item"]["id"]
         context = playback.get("context")
         context_uri = context.get("uri", "") if context else ""
         
         if not context or context.get("type") != "playlist" or active_playlist.id not in context_uri:
-            print(f"Error: Currently playing from a different source.")
-            print(f"  Expected playlist: {active_playlist_name} ({active_playlist.id})")
-            print(f"  Current source: {context.get('type') if context else 'None'} ({context_uri})")
-            print(f"To switch to '{active_playlist_name}', start playing it first, or use --flush.")
-            return []
+            # Check for name match fallback
+            if context and context.get("type") == "playlist":
+                curr_pl_id = context_uri.split(':')[-1]
+                try:
+                    curr_pl = self.sp.sp.playlist(curr_pl_id, fields="name")
+                    if curr_pl and curr_pl.get("name") == active_playlist_name:
+                        print(f"  Note: State reconciliation triggered. Switched to '{active_playlist_name}' ({curr_pl_id})")
+                        active_playlist = Playlist(curr_pl_id, active_playlist_name, is_active=True)
+                        track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
+                        # Immediately sync the DB's active_tracks table to this new playlist
+                        reset_active_tracks(self.db, track_ids)
+                        
+                        # Update established ID in DB to prevent future confusion
+                        set_meta(self.db, f"playlist_id_{active_playlist_name}", curr_pl_id)
+                        
+                        # Validate library content
+                        db_all_ids = set(get_all_active_track_ids(self.db))
+                        unknown_tracks = [tid for tid in track_ids if tid not in db_all_ids]
+                        if unknown_tracks:
+                            print(f"  ⚠️  WARNING: {len(unknown_tracks)} tracks in this playlist are NOT in your library.")
+                    else:
+                        print(f"Error: Currently playing from a different source.")
+                        print(f"  Expected playlist: {active_playlist_name} ({active_playlist.id})")
+                        print(f"  Current source: {curr_pl.get('name') if curr_pl else 'Unknown'} ({curr_pl_id})")
+                        return [], active_playlist
+                except Exception:
+                    return [], active_playlist
+            else:
+                print(f"Error: Currently playing from a different source.")
+                return [], active_playlist
 
         try:
             current_index = track_ids.index(current_track_id)
         except ValueError:
             print(f"Error: Currently playing track not found in '{active_playlist_name}'. Use --flush if you want to reset it.")
-            return []
+            return [], active_playlist
 
         listened_ids = track_ids[:current_index]
         if not listened_ids:
-            return []
+            return [], active_playlist
 
         print(f"Marking {len(listened_ids)} tracks as played.")
         now = datetime.now()
@@ -892,7 +917,7 @@ class Manager:
 
         self.sp.remove_tracks_from_playlist(active_playlist.id, listened_ids)
         remove_active_tracks(self.db, listened_ids)
-        return listened_ids
+        return listened_ids, active_playlist
 
     def flush_active_playlist(self, active_playlist_name: str) -> List[str]:
         """Marks all tracks (except currently playing) as played, clears them, and returns them."""
@@ -930,7 +955,6 @@ class Manager:
         if not removed_ids:
             return
 
-        # Safety Check: If a large percentage of tracks are missing, it might be an API error
         removal_ratio = len(removed_ids) / len(tracked_ids)
         if removal_ratio > 0.5 and len(tracked_ids) > 10:
             print(f"\n⚠️  SAFETY WARNING: {len(removed_ids)} out of {len(tracked_ids)} tracks ({removal_ratio:.1%}) ")
@@ -984,15 +1008,19 @@ class Manager:
         print("="*76 + "\n")
 
     def refill_active_playlist(self, active_playlist_name: str, target_hours: float, mode: str = "default", phone_playlist_name: str = "Phone Listening"):
+        """Refills the active playlist with oldest music, enforcing artist variety."""
         listened_ids = []
-        active_playlist = self.sp.get_active_playlist(active_playlist_name)
         
         if mode == "flush":
+            active_playlist = self.sp.get_active_playlist(active_playlist_name)
             listened_ids = self.flush_active_playlist(active_playlist_name)
         elif mode == "add":
+            active_playlist = self.sp.get_active_playlist(active_playlist_name)
             print("Mode 'add': Just adding more tracks.")
         else: # default
-            listened_ids = self.process_listened_tracks(active_playlist_name)
+            listened_ids, active_playlist = self.process_listened_tracks(active_playlist_name)
+            if not active_playlist: return 
+            
             if not listened_ids:
                 current_count = len(self.sp.get_playlist_tracks_ordered(active_playlist.id))
                 if current_count > 0 and self._get_current_track_id() is None:
@@ -1018,9 +1046,6 @@ class Manager:
             return
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
-        
-        # Queue-Based Spreading Algorithm
-        print(f"Gathering candidate tracks from library (Oldest first)...")
         pool = get_least_recently_played_tracks(self.db, limit=REFILL_CANDIDATE_POOL_SIZE)
         
         artist_locks = {} 
@@ -1076,7 +1101,7 @@ class Manager:
                 med = statistics.median(added_play_counts)
                 print(f"Play count stats for added songs: Low: {low}, Avg: {avg:.1f}, Median: {med}, High: {high}")
 
-            print(f"Adding selected tracks to '{active_playlist_name}'...")
+            print(f"Adding selected tracks to '{active_playlist.name}'...")
             self.sp.add_tracks_to_playlist(active_playlist.id, to_add_ids)
             add_active_tracks(self.db, to_add_ids)
             print("Refill complete.")
@@ -1084,6 +1109,72 @@ class Manager:
             print(f"Warning: Could not find any tracks to add. (Processed {len(pool)} candidates, skipped {skipped_locked_count} due to locks)")
 
         self._display_dashboard()
+
+    def fix_duplicate_playlists(self, target_names: List[str]):
+        """Interactively finds and resolves duplicate playlists for given names."""
+        print("\nScanning for duplicate playlists...")
+        all_matches = {}
+        offset = 0
+        limit = 50
+        while True:
+            response = self.sp._call_with_retry(self.sp.sp.current_user_playlists, limit=limit, offset=offset)
+            items = response.get("items", [])
+            for item in items:
+                if item["name"] in target_names:
+                    if item["name"] not in all_matches:
+                        all_matches[item["name"]] = []
+                    track_count = item.get("tracks", {}).get("total", 0)
+                    all_matches[item["name"]].append({
+                        "id": item["id"],
+                        "name": item["name"],
+                        "tracks": track_count
+                    })
+            if len(items) < limit:
+                break
+            offset += limit
+
+        for name in target_names:
+            matches = all_matches.get(name, [])
+            if not matches:
+                print(f"No playlists found with name '{name}'.")
+                continue
+            
+            print(f"\n--- Resolving duplicates for '{name}' ---")
+            if len(matches) == 1:
+                print(f"Only one playlist found ({matches[0]['id']}). Setting as official.")
+                set_meta(self.db, f"playlist_id_{name}", matches[0]['id'])
+                continue
+
+            print(f"Found {len(matches)} playlists named '{name}':")
+            for idx, m in enumerate(matches, 1):
+                print(f"  [{idx}] ID: {m['id']} | Tracks: {m['tracks']}")
+            
+            try:
+                choice = int(input(f"Select which one to KEEP [1-{len(matches)}]: "))
+                keep = matches[choice - 1]
+                others = [m for i, m in enumerate(matches) if i != (choice - 1)]
+                
+                # Establish the winner
+                set_meta(self.db, f"playlist_id_{name}", keep['id'])
+                print(f"Established '{name}' ({keep['id']}) as the official playlist.")
+
+                # Option to cleanup others
+                confirm_del = input(f"Would you like to DELETE the {len(others)} other duplicate playlists from Spotify? [y/N]: ").lower()
+                if confirm_del == 'y':
+                    for other in others:
+                        print(f"  Removing duplicate {other['id']}...")
+                        self.sp._call_with_retry(self.sp.sp.current_user_unfollow_playlist, other['id'])
+                    print("Duplicates removed.")
+
+                # Option to resync DB state
+                confirm_sync = input(f"Would you like to sync the DB state to the tracks in the established playlist? [y/N]: ").lower()
+                if confirm_sync == 'y':
+                    track_ids = self.sp.get_playlist_tracks_ordered(keep['id'])
+                    reset_active_tracks(self.db, track_ids)
+                    print(f"DB resynced with {len(track_ids)} tracks.")
+
+            except (ValueError, IndexError):
+                print("Invalid choice. Skipping cleanup for this name.")
 
     def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
         """Adds tracks to the specified phone history playlist if it's shorter than configured capacity."""
@@ -1100,16 +1191,19 @@ class Manager:
             print(f"  '{phone_playlist_name}' is full (>= {PHONE_PLAYLIST_CAPACITY_HOURS} hours). Skipping history update.")
 
     def list_adds(self):
+        """Lists addition and ingestion transactions."""
         transactions = [t for t in list_transactions(self.db, "ADD")]
         transactions.extend(list_transactions(self.db, "INGEST"))
         transactions.sort(key=lambda x: x.timestamp, reverse=True)
         self._print_transactions(transactions)
 
     def list_deletes(self):
+        """Lists deletion transactions."""
         transactions = list_transactions(self.db, "DELETE")
         self._print_transactions(transactions)
 
     def _print_transactions(self, transactions: List[Transaction]):
+        """Prints a table of transactions."""
         if not transactions:
             print("No transactions found.")
             return
@@ -1121,16 +1215,19 @@ class Manager:
             print(f"{t.id:<5} {ts:<20} {t.type:<8} {t.track_count:<6} {status:<12} {t.description}")
 
     def show_add(self, trans_id: int):
+        """Shows tracks added in a specific transaction."""
         tracks = get_tracks_by_transaction(self.db, trans_id, "ADD")
         if not tracks:
             tracks = get_tracks_by_transaction(self.db, trans_id, "INGEST")
         self._print_tracks(tracks)
 
     def show_delete(self, trans_id: int):
+        """Shows tracks deleted in a specific transaction."""
         tracks = get_tracks_by_transaction(self.db, trans_id, "DELETE")
         self._print_tracks(tracks)
 
     def _print_tracks(self, tracks: List[Track]):
+        """Prints a summary table of tracks."""
         if not tracks:
             print("No tracks found.")
             return
@@ -1140,6 +1237,7 @@ class Manager:
             print(f"{t.artist[:23]:<25} {t.album[:28]:<30} {t.name}")
 
     def cancel_add(self, trans_id: int):
+        """Reverts an addition transaction by removing tracks from storage."""
         trans = get_transaction(self.db, trans_id)
         if not trans or trans.type not in ["ADD", "INGEST"]:
             print(f"Transaction #{trans_id} (ADD/INGEST) not found.")
@@ -1172,6 +1270,7 @@ class Manager:
         print(f"Tracks marked as deleted in DB. Recorded DELETE transaction #{new_trans_id}")
 
     def cancel_delete(self, trans_id: int):
+        """Reverts a deletion transaction by restoring tracks to storage."""
         trans = get_transaction(self.db, trans_id)
         if not trans or trans.type != "DELETE":
             print(f"Transaction #{trans_id} (DELETE) not found.")
@@ -1207,6 +1306,7 @@ class Manager:
         print(f"Tracks restored in DB.")
 
     def clean_database(self, older_than: str):
+        """Permanently removes tracks deleted from storage longer ago than threshold."""
         match = re.match(r"(\d+)([my])", older_than.lower())
         if not match:
             print("Invalid format. Use e.g., '3m' for 3 months or '1y' for 1 year.")
@@ -1217,6 +1317,7 @@ class Manager:
         print(f"Permanently removed {count} tracks from database deleted over {older_than} ago.")
 
     def whoami(self):
+        """Displays currently authenticated Spotify user."""
         try:
             user = self.sp.sp.current_user()
             print(f"\nSuccessfully authenticated!")

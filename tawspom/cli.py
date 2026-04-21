@@ -5,7 +5,8 @@ from tawspom.core.db import init_db
 from tawspom.core.spotify import SpotifyClient
 from tawspom.core.manager import Manager
 from tawspom.core.constants import (
-    DEFAULT_REFILL_HOURS, RADIO_DEFAULT_MAIN_COUNT, RADIO_DEFAULT_PER_ARTIST
+    DEFAULT_REFILL_HOURS, RADIO_DEFAULT_MAIN_COUNT, RADIO_DEFAULT_PER_ARTIST,
+    FINDNEW_QUALIFY_MIN_TRACKS
 )
 
 # Configurable playlist names with defaults
@@ -29,15 +30,14 @@ def main():
     subparsers.add_parser("deduplicate", help="Find and remove binary duplicates from storage")
     subparsers.add_parser("findversions", help="Find potential versions of songs and put in 'Duplicate Review' playlist")
     subparsers.add_parser("processversions", help="Process the 'Duplicate Review' playlist and delete removed tracks")
-    subparsers.add_parser("findnew", help="Find new albums from artists you have listened to")
+    subparsers.add_parser("findnew", help=f"Find new albums from artists you have listened to (>= {FINDNEW_QUALIFY_MIN_TRACKS} songs)")
+    subparsers.add_parser("fixplaylists", help="Interactively resolve and clean up duplicate playlists")
 
     # Radio
     radio_parser = subparsers.add_parser("artistradio", help="Create a custom artist radio playlist")
     radio_parser.add_argument("name", help="Name of the artist")
-    radio_parser.add_argument("--main-count", type=int, default=RADIO_DEFAULT_MAIN_COUNT, 
-                              help=f"Number of songs from the main artist (default: {RADIO_DEFAULT_MAIN_COUNT})")
-    radio_parser.add_argument("--per-artist", type=int, default=RADIO_DEFAULT_PER_ARTIST, 
-                              help=f"Number of songs to take from EACH discovered related artist (default: {RADIO_DEFAULT_PER_ARTIST})")
+    radio_parser.add_argument("--main-count", type=int, default=RADIO_DEFAULT_MAIN_COUNT, help=f"Number of songs from the main artist (default: {RADIO_DEFAULT_MAIN_COUNT})")
+    radio_parser.add_argument("--per-artist", type=int, default=RADIO_DEFAULT_PER_ARTIST, help=f"Number of songs to take from EACH discovered related artist (default: {RADIO_DEFAULT_PER_ARTIST})")
     radio_parser.add_argument("--filter", choices=["big", "small", "both"], default="both", 
                               help="Filter related artists by size (big = top 50%, small = bottom 50%, both = all)")
 
@@ -72,8 +72,7 @@ def main():
 
     # Refill active playlist
     refill_parser = subparsers.add_parser("refill", help="Refill the active playlist")
-    refill_parser.add_argument("--hours", type=float, default=DEFAULT_REFILL_HOURS, 
-                              help=f"Target duration in hours (default: {DEFAULT_REFILL_HOURS})")
+    refill_parser.add_argument("--hours", type=float, default=DEFAULT_REFILL_HOURS, help=f"Target duration in hours (default: {DEFAULT_REFILL_HOURS})")
     
     refill_mode = refill_parser.add_mutually_exclusive_group()
     refill_mode.add_argument("--flush", action="store_true", help="Flush current playlist and refill from scratch")
@@ -87,7 +86,7 @@ def main():
 
     # Initialize components
     conn = init_db()
-    sp_client = SpotifyClient(user_label=args.user)
+    sp_client = SpotifyClient(user_label=args.user, db_conn=conn)
     manager = Manager(sp_client, conn)
 
     if args.command == "sync":
@@ -106,6 +105,8 @@ def main():
         manager.process_version_review()
     elif args.command == "findnew":
         manager.find_new_music()
+    elif args.command == "fixplaylists":
+        manager.fix_duplicate_playlists([ACTIVE_PLAYLIST_NAME, PHONE_PLAYLIST_NAME])
     elif args.command == "artistradio":
         manager.create_artist_radio(args.name, args.main_count, args.filter, args.per_artist)
     elif args.command == "addartist":

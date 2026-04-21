@@ -27,8 +27,9 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 
 ## 3. Listening Experience
 ### 3.1 The "Active" Playlist (Refill)
-The primary listening source is a configurable rolling window defined by `DEFAULT_REFILL_HOURS` (Default: 15 hours).
+The primary listening source is a configurable rolling window defined by `DEFAULT_REFILL_HOURS` (Default: 15.0 hours).
 - **Configuration**: Playlist name is set via `ACTIVE_PLAYLIST_NAME` in `.env` (default: "My Active Music").
+- **Established ID Persistence**: To prevent the creation of duplicate playlists, the script "locks in" the specific Spotify ID of the active playlist and stores it in the database `meta` table.
 - **Library Dashboard**: At the end of every refill, a dashboard displays:
     - **Counts**: Total active tracks, total duration, and deleted tracks.
     - **Coverage**: Number of "Never Listened" tracks and overall Library Coverage %.
@@ -43,20 +44,20 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
     - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are locked for the next `REFILL_ARTIST_LOCK_WINDOW` tracks (Default: 5). 
     - **Exhaustive Search**: The system scans up to `REFILL_CANDIDATE_POOL_SIZE` oldest candidates to find enough tracks that satisfy the variety window (Default: 2000).
 - **Statistical Reporting**: At the end of each refill, the system reports the play count distribution of the newly added tracks (**Low, Average, Median, High**).
-- **Preservation**:
+- **Preservation & State Reconciliation**:
     - Never remove the currently playing song.
-    - If playback position cannot be determined (and playlist isn't empty), the refill aborts to prevent losing the user's place.
+    - **Smart Playback Detection**: If the currently playing playlist name matches but the ID is different, the system automatically switches its "Established ID" to the playing one and triggers **State Reconciliation**.
+    - **State Reconciliation**: When switching to a new playlist ID, the system immediately resyncs the DB's `active_tracks` table to match the current tracks on Spotify, preventing accidental mass-deletion detections.
 - **Manual Removal Detection**:
     - If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well. 
     - **Mass Removal Safety**: If more than 50% of the active tracks (minimum 10) appear to be removed, the system prompts for user confirmation before deleting from permanent storage to guard against API errors.
-    - **Silent Background Sync**: Normal manual removal processing is silent to keep the UI clean.
 
 ### 3.2 Phone History (Phone Listening)
 - On every `refill` run, tracks identified as "listened" are appended to a secondary history playlist.
 - **Configuration**: Playlist name is set via `PHONE_PLAYLIST_NAME` in `.env` (default: "Phone Listening").
+- **Persistence**: Like the Active playlist, the Phone playlist's Spotify ID is persisted in the database.
 - **Capacity**: This addition only occurs if the playlist is currently shorter than `PHONE_PLAYLIST_CAPACITY_HOURS` (Default: 100 hours).
 - **Optimization**: Duration checks use field-filtering to minimize API payload and prevent timeouts.
-- **Note**: This history is one-way and is not tracked in the local database.
 
 ---
 
@@ -83,7 +84,7 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - **Filtering**:
     - Calculates the midpoint popularity of the discovered group.
     - Supports `--filter`: `big` (above midpoint), `small` (below midpoint), or `both`.
-- **Scalability**: No total song limit. Takes `--per-artist` tracks from **every** peer found.
+- **Scalability**: No total song limit. Takes up to `RADIO_DEFAULT_PER_ARTIST` (Default: 5) tracks from **every** peer found.
 - **Selection**: Uses Round-Robin to ensure every discovered artist is represented before taking a second song from any one artist.
 
 ### 5.2 Deep Discovery (findnew)
@@ -103,8 +104,16 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 
 ---
 
-## 6. Technical Specifications
-- **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, and `handled_albums`.
+## 6. Maintenance Tools
+### 6.1 Playlist Cleanup (fixplaylists)
+- Interactively scans for duplicate playlists with the same name.
+- Allows the user to establish a primary ID and delete redundant duplicates from Spotify.
+- Provides an option to resync the local database state to the tracks in the established playlist.
+
+---
+
+## 7. Technical Specifications
+- **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, `handled_albums`, and `meta`.
 - **Batching**: 
     - Playlists: `SPOTIFY_PLAYLIST_BATCH_SIZE` (Default: 100).
     - Liked Songs: `SPOTIFY_LIKED_SONGS_BATCH_SIZE` (Default: 20).
