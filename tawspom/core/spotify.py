@@ -270,13 +270,19 @@ class SpotifyClient:
             offset += limit
         
         if not matches:
-            user = self._call_with_retry(self.sp.current_user)
-            user_id = user["id"]
-            new_pl = self._call_with_retry(self.sp.user_playlist_create, user_id, name, public=False)
-            self._save_stored_playlist_id(name, new_pl["id"])
-            return Playlist(new_pl["id"], new_pl["name"], is_active=True)
+            print(f"\n⚠️  WARNING: Playlist '{name}' not found on Spotify.")
+            confirm = input(f"Would you like to create a new private playlist named '{name}'? [y/N]: ").lower().strip()
+            if confirm == 'y':
+                user = self._call_with_retry(self.sp.current_user)
+                user_id = user["id"]
+                new_pl = self._call_with_retry(self.sp.user_playlist_create, user_id, name, public=False)
+                self._save_stored_playlist_id(name, new_pl["id"])
+                return Playlist(new_pl["id"], new_pl["name"], is_active=True)
+            else:
+                print("Operation aborted. Please create the playlist manually or check your settings.")
+                return None
 
-        # 3. Handle matches
+        # 3. Handle multiple matches
         selected_pl = None
         if len(matches) > 1:
             print(f"\n⚠️  WARNING: Found {len(matches)} playlists named '{name}'.")
@@ -303,7 +309,7 @@ class SpotifyClient:
         else:
             selected_pl = matches[0][0]
         
-        # 4. Established the winner!
+        # 4. Establish the winner!
         self._save_stored_playlist_id(name, selected_pl.id)
         return selected_pl
 

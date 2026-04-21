@@ -30,6 +30,7 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 The primary listening source is a configurable rolling window defined by `DEFAULT_REFILL_HOURS` (Default: 15.0 hours).
 - **Configuration**: Playlist name is set via `ACTIVE_PLAYLIST_NAME` in `.env` (default: "My Active Music").
 - **Established ID Persistence**: To prevent the creation of duplicate playlists, the script "locks in" the specific Spotify ID of the active playlist and stores it in the database `meta` table.
+- **Creation Safety**: If the established playlist ID is missing or invalid, the script will **ask for user permission** before creating a new one on Spotify.
 - **Library Dashboard**: At the end of every refill, a dashboard displays:
     - **Counts**: Total active tracks, total duration, and deleted tracks.
     - **Coverage**: Number of "Never Listened" tracks and overall Library Coverage %.
@@ -50,7 +51,10 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
     - **State Reconciliation**: When switching to a new playlist ID, the system immediately resyncs the DB's `active_tracks` table to match the current tracks on Spotify, preventing accidental mass-deletion detections.
 - **Manual Removal Detection**:
     - If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well. 
-    - **Mass Removal Safety**: If more than 50% of the active tracks (minimum 10) appear to be removed, the system prompts for user confirmation before deleting from permanent storage to guard against API errors.
+    - **Mass Removal Safety**: If more than 50% of the active tracks (minimum 10) appear to be removed, the system prompts for action:
+        - `[y]es`: Delete the missing tracks from permanent storage.
+        - `[n]o`: Skip deletion for this run.
+        - `[r]esync`: Use the current Spotify playlist as the "correct" state and update the database (clears "ghost" tracks).
 
 ### 3.2 Phone History (Phone Listening)
 - On every `refill` run, tracks identified as "listened" are appended to a secondary history playlist.
@@ -113,7 +117,7 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 ---
 
 ## 7. Technical Specifications
-- **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, `handled_albums`, and `meta`.
+- **Database**: SQLite3 with tables for `track`, `transactions`, `active_tracks`, `duplicate_allowlist`, `artist_checks`, and `handled_albums`.
 - **Batching**: 
     - Playlists: `SPOTIFY_PLAYLIST_BATCH_SIZE` (Default: 100).
     - Liked Songs: `SPOTIFY_LIKED_SONGS_BATCH_SIZE` (Default: 20).

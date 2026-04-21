@@ -43,19 +43,14 @@ class Manager:
         if not name:
             return DEFAULT_STORAGE_LETTER
         
-        # Standardize to uppercase for matching
         name = name.upper()
-        
-        # Specific mapping for Finnish characters
         name = name.replace('Ä', 'A').replace('Å', 'A').replace('Ö', 'O')
         
-        # Normalize other accents (e.g., È -> E)
         nfkd_form = unicodedata.normalize('NFKD', name)
         only_ascii = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
         
         first_char = only_ascii[0] if only_ascii else DEFAULT_STORAGE_LETTER
         
-        # Only use A-Z; symbols/numbers default to storage letter
         if first_char.isalpha() and 'A' <= first_char <= 'Z':
             return first_char
         return DEFAULT_STORAGE_LETTER
@@ -878,10 +873,11 @@ class Manager:
                         print(f"  Note: State reconciliation triggered. Switched to '{active_playlist_name}' ({curr_pl_id})")
                         active_playlist = Playlist(curr_pl_id, active_playlist_name, is_active=True)
                         track_ids = self.sp.get_playlist_tracks_ordered(active_playlist.id)
+                        
                         # Immediately sync the DB's active_tracks table to this new playlist
                         reset_active_tracks(self.db, track_ids)
                         
-                        # Update established ID in DB to prevent future confusion
+                        # Update established ID in DB permanently
                         set_meta(self.db, f"playlist_id_{active_playlist_name}", curr_pl_id)
                         
                         # Validate library content
@@ -960,8 +956,15 @@ class Manager:
             print(f"\n⚠️  SAFETY WARNING: {len(removed_ids)} out of {len(tracked_ids)} tracks ({removal_ratio:.1%}) ")
             print(f"appear to have been removed from your active playlist.")
             print("This could be a Spotify API sync error or a deliberate mass removal.")
-            confirm = input("Are you sure you want to delete these from permanent storage? [y/N]: ").lower()
-            if confirm != 'y':
+            print("  Action: [y]es (delete from storage) / [n]o (skip) / [r]esync DB (use Spotify tracks as correct state)")
+            confirm = input("  >> ").lower().strip()
+            
+            if confirm == 'r':
+                print("Resyncing database to match Spotify playlist tracks...")
+                reset_active_tracks(self.db, current_active_ids)
+                print("DB resynced. Ghost tracks cleared.")
+                return
+            elif confirm != 'y':
                 print("Aborting removal sync. No tracks deleted from storage.")
                 return
 
@@ -1140,9 +1143,17 @@ class Manager:
                 continue
             
             print(f"\n--- Resolving duplicates for '{name}' ---")
+            
+            # Offer resync even for single matches to clean up orphans
             if len(matches) == 1:
                 print(f"Only one playlist found ({matches[0]['id']}). Setting as official.")
                 set_meta(self.db, f"playlist_id_{name}", matches[0]['id'])
+                
+                confirm_sync = input(f"Would you like to sync the DB state to the tracks in this playlist? [y/N]: ").lower()
+                if confirm_sync == 'y':
+                    track_ids = self.sp.get_playlist_tracks_ordered(matches[0]['id'])
+                    reset_active_tracks(self.db, track_ids)
+                    print(f"DB resynced with {len(track_ids)} tracks.")
                 continue
 
             print(f"Found {len(matches)} playlists named '{name}':")
@@ -1215,14 +1226,14 @@ class Manager:
             print(f"{t.id:<5} {ts:<20} {t.type:<8} {t.track_count:<6} {status:<12} {t.description}")
 
     def show_add(self, trans_id: int):
-        """Shows tracks added in a specific transaction."""
+        """Show tracks added/ingested in a transaction."""
         tracks = get_tracks_by_transaction(self.db, trans_id, "ADD")
         if not tracks:
             tracks = get_tracks_by_transaction(self.db, trans_id, "INGEST")
         self._print_tracks(tracks)
 
     def show_delete(self, trans_id: int):
-        """Shows tracks deleted in a specific transaction."""
+        """Show tracks deleted in a transaction."""
         tracks = get_tracks_by_transaction(self.db, trans_id, "DELETE")
         self._print_tracks(tracks)
 
