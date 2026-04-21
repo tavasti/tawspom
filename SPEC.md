@@ -46,7 +46,10 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - **Preservation**:
     - Never remove the currently playing song.
     - If playback position cannot be determined (and playlist isn't empty), the refill aborts to prevent losing the user's place.
-- **Manual Removal Detection**: If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well. This background operation is silent to keep the UI clean.
+- **Manual Removal Detection**:
+    - If a user deletes a track directly from the Active playlist, the system detects this during refill and deletes that track from the permanent A-Z storage as well. 
+    - **Mass Removal Safety**: If more than 50% of the active tracks (minimum 10) appear to be removed, the system prompts for user confirmation before deleting from permanent storage to guard against API errors.
+    - **Silent Background Sync**: Normal manual removal processing is silent to keep the UI clean.
 
 ### 3.2 Phone History (Phone Listening)
 - On every `refill` run, tracks identified as "listened" are appended to a secondary history playlist.

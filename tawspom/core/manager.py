@@ -866,8 +866,13 @@ class Manager:
 
         current_track_id = playback["item"]["id"]
         context = playback.get("context")
-        if not context or context.get("type") != "playlist" or active_playlist.id not in context.get("uri", ""):
-            print(f"Error: Currently playing from a different source. To switch to '{active_playlist_name}', start playing it first, or use --flush.")
+        context_uri = context.get("uri", "") if context else ""
+        
+        if not context or context.get("type") != "playlist" or active_playlist.id not in context_uri:
+            print(f"Error: Currently playing from a different source.")
+            print(f"  Expected playlist: {active_playlist_name} ({active_playlist.id})")
+            print(f"  Current source: {context.get('type') if context else 'None'} ({context_uri})")
+            print(f"To switch to '{active_playlist_name}', start playing it first, or use --flush.")
             return []
 
         try:
@@ -915,12 +920,26 @@ class Manager:
 
     def detect_manual_removals(self, current_active_ids: List[str]):
         """Detects if user manually removed tracks from 'Active Music' and removes from storage."""
-        tracked_ids = set(get_tracked_active_ids(self.db))
+        tracked_ids = list(get_tracked_active_ids(self.db))
+        if not tracked_ids:
+            return
+
         current_set = set(current_active_ids)
+        removed_ids = [tid for tid in tracked_ids if tid not in current_set]
         
-        removed_ids = list(tracked_ids - current_set)
         if not removed_ids:
             return
+
+        # Safety Check: If a large percentage of tracks are missing, it might be an API error
+        removal_ratio = len(removed_ids) / len(tracked_ids)
+        if removal_ratio > 0.5 and len(tracked_ids) > 10:
+            print(f"\n⚠️  SAFETY WARNING: {len(removed_ids)} out of {len(tracked_ids)} tracks ({removal_ratio:.1%}) ")
+            print(f"appear to have been removed from your active playlist.")
+            print("This could be a Spotify API sync error or a deliberate mass removal.")
+            confirm = input("Are you sure you want to delete these from permanent storage? [y/N]: ").lower()
+            if confirm != 'y':
+                print("Aborting removal sync. No tracks deleted from storage.")
+                return
 
         print(f"\nDetected {len(removed_ids)} tracks manually removed from Active Music:")
         removed_tracks = get_tracks_by_ids(self.db, removed_ids)
