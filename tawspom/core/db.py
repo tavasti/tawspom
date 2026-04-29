@@ -3,6 +3,7 @@ import os
 from typing import List, Optional, Tuple, Set, Dict
 from datetime import datetime, timedelta
 from tawspom.models import Track, Transaction
+from tawspom.core.constants import DASHBOARD_OLD_POOL_SIZE, MOMENTUM_WINDOW_DAYS
 
 DB_PATH = os.path.expanduser("~/.local/share/tawspom/tawspom.sqlite3")
 
@@ -380,8 +381,8 @@ def get_library_stats(conn) -> Dict:
     full_history_ms = full_history_ms or 0
     avg_plays = avg_plays or 0
     
-    # 4. Momentum (last 7 days)
-    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    # 4. Momentum
+    cutoff = (datetime.now() - timedelta(days=MOMENTUM_WINDOW_DAYS)).isoformat()
     cur.execute("SELECT SUM(duration_ms) FROM track WHERE last_played_at > ?", (cutoff,))
     momentum_ms = cur.fetchone()[0] or 0
     
@@ -392,9 +393,9 @@ def get_library_stats(conn) -> Dict:
     
     cur.execute("""
         SELECT artist, COUNT(*) as c 
-        FROM (SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT 1000)
+        FROM (SELECT artist FROM track WHERE is_deleted = 0 ORDER BY last_played_at ASC NULLS FIRST LIMIT ?)
         GROUP BY artist ORDER BY c DESC LIMIT 3
-    """)
+    """, (DASHBOARD_OLD_POOL_SIZE,))
     top_waiting = cur.fetchall()
 
     return {

@@ -14,7 +14,7 @@ REFILL_CANDIDATE_POOL_SIZE = 2000
 # Window for calculating momentum statistics (days)
 MOMENTUM_WINDOW_DAYS = 7
 # Pool size for identifying "Top Waiting Artists" in dashboard
-DASHBOARD_OLD_POOL_SIZE = 1000
+DASHBOARD_OLD_POOL_SIZE = 20
 
 # --- Phone History ---
 # Capacity limit for the Phone Listening history playlist (hours)
