@@ -18,3 +18,9 @@
 - Respect the magic-number-to-constant migration.
 - Always use the constants defined in `tawspom/core/constants.py`.
 - Prioritize library integrity and safety checks (e.g., mass-deletion confirmation).
+
+## 4. Program is in active use!
+- Program is in active use, has been used much, and remaining database content is really valuable asset
+- If database schema needs to be changed, change needs to be handled with automatic conversion
+- Existing data in database must not be truncated in any case
+
