@@ -1,9 +1,11 @@
 import os
 import time
 from typing import List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse, quote as urllib_parse_quote
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.exceptions import SpotifyOauthError
 from requests.exceptions import ConnectionError
 from urllib3.exceptions import ProtocolError
 from tawspom.models import Track, Playlist
@@ -20,27 +22,38 @@ class SpotifyClient:
 
     def _init_sp(self):
         """Initializes or re-initializes the Spotify client."""
-        cache_path = os.path.expanduser(f"~/.tawspom/token_{self.user_label}.json")
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        
+        self._cache_path = os.path.expanduser(f"~/.tawspom/token_{self.user_label}.json")
+        os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
                 scope=self.scope,
                 client_id=os.getenv("SPOTIPY_CLIENT_ID"),
                 client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
                 redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-                cache_path=cache_path,
+                cache_path=self._cache_path,
                 open_browser=False
             ),
             requests_timeout=10
         )
 
     def _call_with_retry(self, func, *args, **kwargs):
-        """Wraps a Spotify API call with a retry mechanism for connection errors."""
+        """Wraps a Spotify API call with a retry mechanism for connection and auth errors."""
         max_retries = 3
+        reauth_done = False
         for i in range(max_retries):
             try:
                 return func(*args, **kwargs)
+            except SpotifyOauthError as e:
+                # Handle expired refresh token (invalid_grant)
+                # Spotify deprecated one-time refresh tokens; they now expire after 6 months.
+                # Per Spotify policy: discard the token and re-authenticate the user.
+                if e.error == "invalid_grant" and not reauth_done:
+                    reauth_done = True
+                    self._handle_expired_token()
+                    # Retry the original call with fresh token (one more attempt)
+                    continue
+                raise
             except (ConnectionError, ProtocolError) as e:
                 if i == max_retries - 1:
                     raise
@@ -48,6 +61,60 @@ class SpotifyClient:
                 time.sleep(2)
                 self._init_sp()
         return None
+
+    def _handle_expired_token(self):
+        """Handle expired refresh token: delete stale cache and re-authenticate user."""
+        print("\n" + "=" * 60)
+        print("⚠️  YOUR SPOTIFY SESSION HAS EXPIRED")
+        print("=" * 60)
+        print("\nSpotify refresh tokens expire after 6 months.")
+        print("You need to authorize tawspom again.\n")
+
+        # Delete the stale cache file so spotipy doesn't retry the dead token
+        if os.path.exists(self._cache_path):
+            os.remove(self._cache_path)
+            print(f"Removed expired token cache: {self._cache_path}\n")
+
+        # Build and display the authorization URL
+        redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI", "")
+        client_id = os.getenv("SPOTIPY_CLIENT_ID", "")
+        auth_url = (
+            f"https://accounts.spotify.com/authorize"
+            f"?client_id={urllib_parse_quote(client_id)}"
+            f"&response_type=code"
+            f"&redirect_uri={urllib_parse_quote(redirect_uri)}"
+            f"&scope={urllib_parse_quote(self.scope, safe=' ')}"
+        )
+
+        print(f"1. Open this URL in your browser:\n\n   {auth_url}\n")
+        print("2. Log in to Spotify and authorize tawspom")
+        print("3. Paste the redirect URL below:\n")
+
+        # Get the redirect URL from user
+        redirect_url = input("> ").strip()
+
+        # Extract the authorization code from the redirect URL
+        parsed = urlparse(redirect_url)
+        params = parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+
+        if not code:
+            # Error redirect? Check for error param
+            error = params.get("error", [None])[0]
+            if error:
+                print(f"\nAuthorization denied: {error}")
+            else:
+                print("\n❌ Could not extract authorization code from the URL.")
+                print("Make sure you pasted the full redirect URL.")
+            raise SpotifyOauthError("Authorization failed")
+
+        # Exchange the authorization code for a new token (spotipy caches it automatically)
+        self._init_sp()
+        self.sp.auth_manager.get_access_token(code)
+        print("\n✅ Authorization successful!\n")
+
+        # Re-initialize so the cached token is loaded properly
+        self._init_sp()
 
     def get_storage_playlists(self) -> List[Playlist]:
         """Fetches all playlists that have a single-character name (A-Z)."""
