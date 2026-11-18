@@ -114,16 +114,51 @@ class Manager:
 
         # Compare Spotify state with DB state to find manual removals
         db_track_ids = set(get_all_active_track_ids(self.db))
-        missing_ids = list(db_track_ids - spotify_track_ids)
-        
-        if missing_ids:
-            print(f"\nDetected {len(missing_ids)} tracks removed manually from Spotify storage playlists:")
-            missing_tracks = get_tracks_by_ids(self.db, missing_ids)
-            self._print_tracks(missing_tracks)
-            
-            trans_id = create_transaction(self.db, "DELETE", len(missing_ids), "Sync: Manual removal from storage")
-            mark_tracks_deleted(self.db, missing_ids, trans_id)
-            print(f"Recorded DELETE transaction #{trans_id}\n")
+        deletion_skipped = False
+
+        # Safety: an empty read from Spotify is never evidence of mass removal
+        if not playlist_stats or not spotify_track_ids:
+            print("\n⚠️  SAFETY ABORT: no storage playlists (or no tracks) could be read from Spotify.")
+            print("   This is usually a temporary API problem. Deletion detection is SKIPPED")
+            print("   to protect your library. Re-run sync when Spotify is reachable.")
+            deletion_skipped = True
+        else:
+            while True:
+                missing_ids = list(db_track_ids - spotify_track_ids)
+                if not missing_ids:
+                    break
+
+                # Mass-removal safety: same pattern as refill
+                is_mass = len(db_track_ids) > 10 and len(missing_ids) / len(db_track_ids) > 0.5
+                if is_mass:
+                    print(f"\n⚠️  SAFETY WARNING: {len(missing_ids)} out of {len(db_track_ids)} tracks "
+                          f"({len(missing_ids) / len(db_track_ids):.1%})")
+                    print("appear to be missing from your storage playlists.")
+                    print("This could be a Spotify API sync error or a deliberate mass removal.")
+                    print("  Action: [y]es (mark as deleted) / [n]o (skip) / [r]esync (re-fetch from Spotify)")
+                    confirm = input("  >> ").lower().strip()
+                    if confirm == 'r':
+                        print("Re-fetching storage playlists from Spotify...")
+                        spotify_track_ids, playlist_stats = self._fetch_all_storage_tracks()
+                        if not playlist_stats or not spotify_track_ids:
+                            print("⚠️  Re-fetch also returned no data. Deletion detection is SKIPPED "
+                                  "to protect your library.")
+                            deletion_skipped = True
+                            break
+                        continue
+                    elif confirm != 'y':
+                        print("Skipping deletion detection. No tracks marked as deleted.")
+                        deletion_skipped = True
+                        break
+
+                print(f"\nDetected {len(missing_ids)} tracks removed manually from Spotify storage playlists:")
+                missing_tracks = get_tracks_by_ids(self.db, missing_ids)
+                self._print_tracks(missing_tracks)
+
+                trans_id = create_transaction(self.db, "DELETE", len(missing_ids), "Sync: Manual removal from storage")
+                mark_tracks_deleted(self.db, missing_ids, trans_id)
+                print(f"Recorded DELETE transaction #{trans_id}\n")
+                break
 
         # Print summary table
         total_songs = 0
@@ -137,7 +172,10 @@ class Manager:
         
         print("-" * 30)
         print(f"{'TOTAL':<10} {total_songs:<8} {self._format_duration(total_duration_ms):<12}")
-        print("\nStorage synced successfully.")
+        if deletion_skipped:
+            print("\nSync finished with warnings — deletion detection was skipped.")
+        else:
+            print("\nStorage synced successfully.")
 
     def ingest_liked_songs(self):
         """Moves tracks from 'Liked Songs' to storage playlists, avoiding duplicates."""
@@ -160,45 +198,111 @@ class Manager:
         if already_there_count > 0:
             print(f"Note: {already_there_count} tracks were already in storage. They will only be removed from 'Liked Songs'.")
 
+        skipped_tracks: list[Track] = []
+
         if to_move:
             print(f"Moving {len(to_move)} new songs to A-Z storage...")
-            tracks_by_letter: Dict[str, List[Track]] = {}
+            tracks_by_letter: dict[str, list[Track]] = {}
             for track in to_move:
                 letter = self._get_storage_letter(track.name)
                 if letter not in tracks_by_letter:
                     tracks_by_letter[letter] = []
                 tracks_by_letter[letter].append(track)
                 
-            trans_id = create_transaction(self.db, "INGEST", len(to_move), f"Ingest from Liked Songs")
             current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
             now = datetime.now()
+            added_tracks: list[Track] = []
 
             for letter in sorted(tracks_by_letter.keys()):
                 playlist_id = current_playlists.get(letter)
                 if not playlist_id:
-                    print(f"Creating storage playlist '{letter}'...")
-                    new_pl = self.sp.create_playlist(letter)
-                    playlist_id = new_pl.id
+                    # Double-check before ever creating a playlist (prevents duplicates)
+                    playlist_id = self._resolve_storage_playlist(letter)
+                    if playlist_id is None:
+                        # Playlist could not be verified; keep these tracks in 'Liked Songs'
+                        skipped_tracks.extend(tracks_by_letter[letter])
+                        continue
+                    current_playlists[letter] = playlist_id
                 
                 tracks = tracks_by_letter[letter]
                 track_ids = [t.id for t in tracks]
                 
                 print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
-                self.sp.add_tracks_to_playlist(playlist_id, track_ids)
+                _added, skipped = self.sp.add_tracks_to_playlist_unique(playlist_id, track_ids)
+                if skipped:
+                    print(f"  Note: {len(skipped)} tracks were already in playlist '{letter}' and not added again.")
                 
                 # Update tracks with storage info before DB upsert
                 for track in tracks:
                     track.storage_playlist_id = playlist_id
-                    track.add_transaction_id = trans_id
                     track.added_at = now
-                
-                upsert_tracks(self.db, tracks)
-            print(f"New tracks recorded in DB (Transaction #{trans_id})")
+                added_tracks.extend(tracks)
+            
+            if added_tracks:
+                trans_id = create_transaction(self.db, "INGEST", len(added_tracks), "Ingest from Liked Songs")
+                for track in added_tracks:
+                    track.add_transaction_id = trans_id
+                upsert_tracks(self.db, added_tracks)
+                print(f"New tracks recorded in DB (Transaction #{trans_id})")
 
-        # Always clear Liked Songs to treat it as an inbox
-        print(f"Cleaning up 'Liked Songs' ({len(liked_tracks)} tracks)...")
-        self.sp.remove_liked_songs([t.id for t in liked_tracks])
+            if skipped_tracks:
+                print(f"\n⚠️  WARNING: {len(skipped_tracks)} tracks were NOT ingested because their storage")
+                print("   playlist could not be verified on Spotify. They remain in 'Liked Songs'.")
+                print("   Check your playlists (or run fixplaylists) and re-run sync.")
+
+        # Clear only the processed tracks from Liked Songs (skipped ones stay for the next run)
+        skipped_ids = {t.id for t in skipped_tracks}
+        to_remove = [t.id for t in liked_tracks if t.id not in skipped_ids]
+        if to_remove:
+            print(f"Cleaning up 'Liked Songs' ({len(to_remove)} tracks)...")
+            self.sp.remove_liked_songs(to_remove)
         print("Ingest complete.")
+
+    def _get_db_playlist_id_for_letter(self, letter: str) -> str | None:
+        """Returns the storage playlist ID that the DB's active tracks for `letter` point to.
+        Returns None if the DB has no active tracks for this letter."""
+        cur = self.db.cursor()
+        cur.execute("SELECT name, storage_playlist_id FROM track WHERE is_deleted = 0 AND storage_playlist_id != ''")
+        counts: dict[str, int] = {}
+        for name, pl_id in cur.fetchall():
+            if self._get_storage_letter(name) == letter:
+                counts[pl_id] = counts.get(pl_id, 0) + 1
+        if not counts:
+            return None
+        # If tracks point to several playlists (e.g. after a duplicate-creation incident),
+        # prefer the one holding the most tracks
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
+    def _resolve_storage_playlist(self, letter: str) -> str | None:
+        """Resolves the storage playlist ID for `letter` without ever creating a duplicate.
+        Called when the initial playlist fetch did not include `letter`.
+        Retries the fetch, then verifies the playlist ID stored in the DB.
+        Only creates a new playlist when the DB has no tracks for this letter at all.
+        Returns None when the playlist cannot be verified - the caller must NOT create one."""
+        # 1. Retry the playlist fetch (the initial one may have been incomplete)
+        print(f"  Playlist '{letter}' not found in initial fetch. Re-checking Spotify...")
+        for p in self.sp.get_storage_playlists():
+            if p.name == letter:
+                print(f"  Found playlist '{letter}' on retry (ID: {p.id}).")
+                return p.id
+
+        # 2. Verify the playlist ID stored in the DB for this letter
+        db_pl_id = self._get_db_playlist_id_for_letter(letter)
+        if db_pl_id:
+            if self.sp.get_playlist_name(db_pl_id) == letter:
+                print(f"  Verified DB-stored playlist '{letter}' (ID: {db_pl_id}) still exists on Spotify.")
+                return db_pl_id
+            print(f"  DB points to playlist ID {db_pl_id}, which is not available on Spotify as '{letter}'.")
+
+        # 3. No DB tracks for this letter at all -> genuinely new, safe to create
+        if db_pl_id is None:
+            print(f"  No existing tracks for '{letter}' in DB. Creating storage playlist '{letter}'...")
+            return self.sp.create_playlist(letter).id
+
+        # 4. DB has tracks for this letter but the playlist cannot be verified -> do NOT create
+        print(f"  ⚠️  Could not verify storage playlist '{letter}' on Spotify, but the DB has tracks for it.")
+        print(f"  NOT creating a new playlist to avoid duplicates.")
+        return None
 
     def deduplicate_storage(self):
         """Identifies and removes duplicate tracks (same artist/name/duration)."""
@@ -276,6 +380,80 @@ class Manager:
         mark_tracks_deleted(self.db, [t.id for t in to_delete], trans_id)
         print(f"Deduplication complete. Recorded DELETE transaction #{trans_id}")
 
+    def purge_storage_duplicates(self):
+        """Removes duplicate track copies from A-Z storage playlists.
+        Keeps exactly one copy of every track (the first occurrence) and verifies
+        afterwards that no track was lost entirely."""
+        print("Scanning A-Z storage playlists for duplicate tracks...")
+        playlists = self.sp.get_storage_playlists()
+        if not playlists:
+            print("No storage playlists found. Nothing to do.")
+            return
+
+        # First pass: scan everything and build the plan
+        plan = []  # (pl_id, pl_name, set_of_unique_track_ids)
+        total_tracks = 0
+        total_dups = 0
+        for pl in sorted(playlists, key=lambda p: p.name):
+            items = self.sp.get_playlist_items_with_positions(pl.id)
+            if not items:
+                continue
+            total_tracks += len(items)
+            seen = set()
+            dups = 0
+            for pos, tid in items:
+                if tid in seen:
+                    dups += 1
+                else:
+                    seen.add(tid)
+            print(f"  {pl.name}: {len(items)} tracks, {dups} duplicates")
+            if dups:
+                total_dups += dups
+                plan.append((pl.id, pl.name, seen))
+
+        if not plan:
+            print("\nNo duplicates found. Nothing to do.")
+            return
+
+        print(f"\nFound {total_dups} extra copies across {len(plan)} playlists (of {total_tracks} total tracks).")
+        print("The first copy of every track is kept; only extra copies are removed.")
+
+        # Safety: a correct scan can never flag more copies than there are tracks
+        if total_dups >= total_tracks:
+            print(f"\n⚠️  SAFETY ABORT: {total_dups} removals out of {total_tracks} tracks looks wrong.")
+            print("Aborting without removing anything.")
+            return
+
+        print("\nProceed with removing these duplicates? [y/N]: ")
+        confirm = input().lower()
+        if confirm != 'y':
+            print("Operation cancelled.")
+            return
+
+        removed_total = 0
+        for pl_id, pl_name, unique_before in plan:
+            removed = self.sp.remove_playlist_duplicates(pl_id)
+            removed_total += removed
+            print(f"  Playlist '{pl_name}': removed {removed} duplicates.")
+
+        # Verify: every track must still be present exactly once (no track lost entirely)
+        print("\nVerifying results...")
+        problems = 0
+        for pl_id, pl_name, unique_before in plan:
+            items = self.sp.get_playlist_items_with_positions(pl_id)
+            ids = [tid for pos, tid in items]
+            unique_after = set(ids)
+            if len(ids) != len(unique_after):
+                print(f"  ⚠️  Playlist '{pl_name}': still has {len(ids) - len(unique_after)} duplicates.")
+                problems += 1
+            lost = unique_before - unique_after
+            if lost:
+                print(f"  ⚠️  Playlist '{pl_name}': {len(lost)} tracks are missing entirely!")
+                problems += 1
+        if problems == 0:
+            print("  OK: every track remains in its playlist exactly once.")
+        print(f"\nPurge complete. Removed {removed_total} duplicate copies.")
+
     def _get_root_name(self, name: str) -> str:
         """Strips common version/remix/feat suffixes to find the 'root' song name."""
         # Using centralized regex keywords for consistency
@@ -339,7 +517,7 @@ class Manager:
         print(f"Clearing and populating '{review_pl.name}'...")
         existing_ids = self.sp.get_playlist_tracks_ordered(review_pl.id)
         self.sp.remove_tracks_from_playlist(review_pl.id, existing_ids)
-        self.sp.add_tracks_to_playlist(review_pl.id, tracks_to_review)
+        self.sp.add_tracks_to_playlist_unique(review_pl.id, tracks_to_review)
         
         save_review_session(self.db, session_data)
         
@@ -386,7 +564,7 @@ class Manager:
             
             print("These will be restored to the 'Duplicate Review' playlist for you to try again.")
             restore_ids = [tid for g in restored_groups for tid in g]
-            self.sp.add_tracks_to_playlist(review_pl.id, restore_ids)
+            self.sp.add_tracks_to_playlist_unique(review_pl.id, restore_ids)
 
         if kept_duplicate_groups:
             print(f"\nYou have kept multiple versions for {len(kept_duplicate_groups)} songs:")
@@ -550,32 +728,42 @@ class Manager:
             print("Operation cancelled.")
             return
 
-        trans_id = create_transaction(self.db, "ADD", total_tracks_to_add, f"addartist: {selected_artist['name']}")
         current_playlists = {p.name: p.id for p in self.sp.get_storage_playlists()}
         now = datetime.now()
+        added_tracks: List[Track] = []
 
         for letter in sorted(tracks_by_letter.keys()):
             playlist_id = current_playlists.get(letter)
             if not playlist_id:
-                print(f"Creating storage playlist '{letter}'...")
-                new_pl = self.sp.create_playlist(letter)
-                playlist_id = new_pl.id
+                # Double-check before ever creating a playlist (prevents duplicates)
+                playlist_id = self._resolve_storage_playlist(letter)
+                if playlist_id is None:
+                    print(f"  ⚠️  Skipping tracks for '{letter}' (playlist could not be verified).")
+                    continue
+                current_playlists[letter] = playlist_id
             
             tracks = tracks_by_letter[letter]
             track_ids = [t.id for t in tracks]
             
             print(f"  Adding {len(track_ids)} tracks to playlist '{letter}'...")
-            self.sp.add_tracks_to_playlist(playlist_id, track_ids)
+            _added, skipped = self.sp.add_tracks_to_playlist_unique(playlist_id, track_ids)
+            if skipped:
+                print(f"  Note: {len(skipped)} tracks were already in playlist '{letter}' and not added again.")
             
             # Update tracks with storage info before DB upsert
             for track in tracks:
                 track.storage_playlist_id = playlist_id
-                track.add_transaction_id = trans_id
                 track.added_at = now
-            
-            upsert_tracks(self.db, tracks)
+            added_tracks.extend(tracks)
         
-        print(f"Artist '{selected_artist['name']}' added to storage. Transaction #{trans_id}")
+        if added_tracks:
+            trans_id = create_transaction(self.db, "ADD", len(added_tracks), f"addartist: {selected_artist['name']}")
+            for track in added_tracks:
+                track.add_transaction_id = trans_id
+            upsert_tracks(self.db, added_tracks)
+            print(f"Artist '{selected_artist['name']}' added to storage. Transaction #{trans_id}")
+        else:
+            print("No tracks added (all storage playlists failed verification).")
 
     def create_artist_radio(self, artist_name: str, main_count: int, size_filter: str, per_artist: int):
         """Creates a custom artist radio using the robot scraper for discovery with interactive selection."""
@@ -663,7 +851,7 @@ class Manager:
         self.sp.remove_tracks_from_playlist(radio_pl.id, existing_ids)
         
         random.shuffle(selected_track_ids)
-        self.sp.add_tracks_to_playlist(radio_pl.id, selected_track_ids)
+        self.sp.add_tracks_to_playlist_unique(radio_pl.id, selected_track_ids)
         
         print(f"\nRadio playlist '{radio_name}' created with {len(selected_track_ids)} tracks.")
 
@@ -751,11 +939,16 @@ class Manager:
                         for letter, letter_tracks in tracks_by_letter.items():
                             playlist_id = current_playlists.get(letter)
                             if not playlist_id:
-                                playlist_id = self.sp.create_playlist(letter).id
+                                playlist_id = self._resolve_storage_playlist(letter)
+                                if playlist_id is None:
+                                    print(f"    ⚠️  Skipping tracks for '{letter}' (playlist could not be verified).")
+                                    continue
                                 current_playlists[letter] = playlist_id
                             
                             tids = [t.id for t in letter_tracks]
-                            self.sp.add_tracks_to_playlist(playlist_id, tids)
+                            _added, skipped = self.sp.add_tracks_to_playlist_unique(playlist_id, tids)
+                            if skipped:
+                                print(f"    Note: {len(skipped)} tracks were already in playlist '{letter}' and not added again.")
                             for t in letter_tracks:
                                 t.storage_playlist_id = playlist_id
                                 t.add_transaction_id = trans_id
@@ -812,11 +1005,16 @@ class Manager:
                             for letter, letter_tracks in tracks_by_letter.items():
                                 playlist_id = current_playlists.get(letter)
                                 if not playlist_id:
-                                    playlist_id = self.sp.create_playlist(letter).id
+                                    playlist_id = self._resolve_storage_playlist(letter)
+                                    if playlist_id is None:
+                                        print(f"    ⚠️  Skipping tracks for '{letter}' (playlist could not be verified).")
+                                        continue
                                     current_playlists[letter] = playlist_id
                                 
                                 tids = [t.id for t in letter_tracks]
-                                self.sp.add_tracks_to_playlist(playlist_id, tids)
+                                _added, skipped = self.sp.add_tracks_to_playlist_unique(playlist_id, tids)
+                                if skipped:
+                                    print(f"    Note: {len(skipped)} tracks were already in playlist '{letter}' and not added again.")
                                 for t in letter_tracks:
                                     t.storage_playlist_id = playlist_id
                                     t.add_transaction_id = trans_id
@@ -1029,6 +1227,10 @@ class Manager:
                 if current_count > 0 and self._get_current_track_id() is None:
                     return
 
+        if active_playlist is None:
+            print("No active playlist found. Aborting refill.")
+            return
+
         if listened_ids:
             self._update_phone_listening(listened_ids, phone_playlist_name)
 
@@ -1105,7 +1307,9 @@ class Manager:
                 print(f"Play count stats for added songs: Low: {low}, Avg: {avg:.1f}, Median: {med}, High: {high}")
 
             print(f"Adding selected tracks to '{active_playlist.name}'...")
-            self.sp.add_tracks_to_playlist(active_playlist.id, to_add_ids)
+            _added, skipped = self.sp.add_tracks_to_playlist_unique(active_playlist.id, to_add_ids)
+            if skipped:
+                print(f"  Note: {len(skipped)} tracks were already in the playlist and not added again.")
             add_active_tracks(self.db, to_add_ids)
             print("Refill complete.")
         else:
@@ -1190,14 +1394,19 @@ class Manager:
     def _update_phone_listening(self, track_ids: List[str], phone_playlist_name: str):
         """Adds tracks to the specified phone history playlist if it's shorter than configured capacity."""
         pl = self.sp.get_active_playlist(phone_playlist_name)
-        
+        if pl is None:
+            print(f"  Playlist '{phone_playlist_name}' not found. Skipping history update.")
+            return
+
         print(f"Checking '{phone_playlist_name}' capacity...")
         current_ms = self.sp.get_playlist_duration_ms(pl.id)
         
         limit_ms = int(PHONE_PLAYLIST_CAPACITY_HOURS * 3600 * 1000)
         if current_ms < limit_ms:
             print(f"  Adding {len(track_ids)} tracks to history...")
-            self.sp.add_tracks_to_playlist(pl.id, track_ids)
+            _added, skipped = self.sp.add_tracks_to_playlist_unique(pl.id, track_ids)
+            if skipped:
+                print(f"  Note: {len(skipped)} tracks were already in history and not added again.")
         else:
             print(f"  '{phone_playlist_name}' is full (>= {PHONE_PLAYLIST_CAPACITY_HOURS} hours). Skipping history update.")
 
@@ -1304,8 +1513,15 @@ class Manager:
                 by_playlist[t.storage_playlist_id] = []
             by_playlist[t.storage_playlist_id].append(t.id)
         
+        total_added = 0
+        total_skipped = 0
         for pl_id, track_ids in by_playlist.items():
-            self.sp.add_tracks_to_playlist(pl_id, track_ids)
+            added, skipped = self.sp.add_tracks_to_playlist_unique(pl_id, track_ids)
+            total_added += len(added)
+            total_skipped += len(skipped)
+        if total_skipped:
+            print(f"  Note: {total_skipped} tracks were already in their playlists and not added again.")
+        print(f"  Restored {total_added} tracks to Spotify storage.")
 
         unmark_tracks_deleted(self.db, [t.id for t in tracks])
         set_transaction_cancelled_status(self.db, trans_id, True)

@@ -32,6 +32,7 @@ def main():
     subparsers.add_parser("processversions", help="Process the 'Duplicate Review' playlist and delete removed tracks")
     subparsers.add_parser("findnew", help=f"Find new albums from artists you have listened to (>= {FINDNEW_QUALIFY_MIN_TRACKS} songs)")
     subparsers.add_parser("fixplaylists", help="Interactively resolve and clean up duplicate playlists")
+    subparsers.add_parser("purgedupes", help="Remove duplicate copies of tracks from A-Z storage playlists (keeps one copy of each)")
 
     # Radio
     radio_parser = subparsers.add_parser("artistradio", help="Create a custom artist radio playlist")
@@ -107,6 +108,8 @@ def main():
         manager.find_new_music()
     elif args.command == "fixplaylists":
         manager.fix_duplicate_playlists([ACTIVE_PLAYLIST_NAME, PHONE_PLAYLIST_NAME])
+    elif args.command == "purgedupes":
+        manager.purge_storage_duplicates()
     elif args.command == "artistradio":
         manager.create_artist_radio(args.name, args.main_count, args.filter, args.per_artist)
     elif args.command == "addartist":

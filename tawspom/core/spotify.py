@@ -1,15 +1,16 @@
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from urllib.parse import parse_qs, urlparse, quote as urllib_parse_quote
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from spotipy.exceptions import SpotifyOauthError
+from spotipy.exceptions import SpotifyException, SpotifyOauthError
 from requests.exceptions import ConnectionError
 from urllib3.exceptions import ProtocolError
 from tawspom.models import Track, Playlist
 from tawspom.core.db import get_meta, set_meta
+from tawspom.core.constants import SPOTIFY_PLAYLIST_BATCH_SIZE
 
 load_dotenv()
 
@@ -314,6 +315,14 @@ class SpotifyClient:
         except Exception:
             return False
 
+    def get_playlist_name(self, pl_id: str) -> str | None:
+        """Fetches a playlist's name. Returns None if the playlist is unavailable."""
+        try:
+            pl = self._call_with_retry(self.sp.playlist, pl_id, fields="id,name")
+            return pl.get("name") if pl else None
+        except (SpotifyException, ConnectionError, ProtocolError):
+            return None
+
     def get_active_playlist(self, name: str) -> Optional[Playlist]:
         """Finds or creates an 'Active' playlist by name, prioritizing the established ID or currently playing."""
         # 1. Check if we have an established ID in DB
@@ -398,6 +407,19 @@ class SpotifyClient:
         for i in range(0, len(track_ids), 100):
             self._call_with_retry(self.sp.playlist_add_items, playlist_id, track_ids[i:i+100])
 
+    def add_tracks_to_playlist_unique(self, playlist_id: str, track_ids: list[str]) -> tuple[list[str], list[str]]:
+        """Adds tracks to a playlist, skipping any that are already present.
+        Central guard against Spotify-side duplicates on all add paths.
+        Returns (added_ids, skipped_ids) so callers can report avoided duplicates."""
+        if not track_ids:
+            return [], []
+        existing_ids = set(self.get_playlist_tracks_ordered(playlist_id))
+        to_add = [tid for tid in track_ids if tid not in existing_ids]
+        skipped = [tid for tid in track_ids if tid in existing_ids]
+        if to_add:
+            self.add_tracks_to_playlist(playlist_id, to_add)
+        return to_add, skipped
+
     def get_playlist_tracks_ordered(self, playlist_id: str) -> List[str]:
         """Returns track IDs in the order they appear in the playlist."""
         track_ids = []
@@ -411,6 +433,84 @@ class SpotifyClient:
                 break
             offset += limit
         return track_ids
+
+    def get_playlist_items_with_positions(self, playlist_id: str) -> list[tuple[int, str]]:
+        """Fetches a playlist as [(position, track_id), ...], zero-based positions
+        in current playlist order."""
+        items: list[tuple[int, str]] = []
+        offset = 0
+        limit = SPOTIFY_PLAYLIST_BATCH_SIZE
+        while True:
+            result = self._call_with_retry(
+                self.sp.playlist_items, playlist_id,
+                fields="items(track(id))", limit=limit, offset=offset
+            )
+            if not result:
+                break
+            page = result.get("items", [])
+            for idx, item in enumerate(page):
+                t = item.get("track")
+                if t:
+                    items.append((offset + idx, t["id"]))
+            if len(page) < limit:
+                break
+            offset += limit
+        return items
+
+    def remove_playlist_duplicates(self, playlist_id: str) -> int:
+        """Remove all duplicate occurrences from a playlist, keeping the first copy of each track.
+
+        Spotify's ``DELETE /playlists/{id}/tracks`` endpoint currently IGNORES the
+        ``positions`` field (a known API bug, spotipy#1098): naming a track removes
+        ALL of its copies, and passing a ``snapshot_id`` makes the call a no-op. So a
+        true "remove this specific occurrence" is not possible via the API.
+
+        The reliable workaround is: for each duplicated track, remove ALL of its
+        copies, then re-add the track once at the position of its original first
+        copy. This leaves exactly one copy (at the first copy's position) and never
+        removes a track entirely.
+
+        Side effect: re-adding a track resets its "added at" timestamp (a Spotify
+        limitation of this workaround).
+
+        Returns the number of extra copies removed.
+        """
+        tracks = self.get_playlist_tracks_ordered(playlist_id)
+        if not tracks:
+            return 0
+
+        # In-memory model of the playlist, kept in sync as duplicates are collapsed.
+        model = list(tracks)
+        full = {tid: f"spotify:track:{tid}" for tid in set(model)}
+        removed = 0
+        while True:
+            # Find any track that still has more than one copy.
+            counts: dict[str, int] = {}
+            for tid in model:
+                counts[tid] = counts.get(tid, 0) + 1
+            dup = next((t for t, c in counts.items() if c > 1), None)
+            if dup is None:
+                break
+            pos = model.index(dup)  # first-copy position in the current model
+            # Remove every copy, then re-add once at the first copy's position.
+            if self._call_with_retry(
+                self.sp.playlist_remove_all_occurrences_of_items, playlist_id, [full[dup]]
+            ) is None:
+                print(f"  ⚠️  Removal failed for {dup[:8]}…; stopping early with {removed} removed so far.")
+                break
+            readd = self._call_with_retry(
+                self.sp.playlist_add_items, playlist_id, [full[dup]], position=pos
+            )
+            if readd is None:
+                # Fallback: append at the end rather than lose the track entirely.
+                readd = self._call_with_retry(self.sp.playlist_add_items, playlist_id, [full[dup]])
+            if readd is None:
+                print(f"  ⚠️  Could not re-add {dup[:8]}… after removal — track may be missing!")
+                break
+            model = [t for t in model if t != dup]
+            model.insert(pos, dup)
+            removed += counts[dup] - 1
+        return removed
 
     def search_artists_by_genre(self, genre: str, limit: int = 50) -> List[dict]:
         """Discovers artists by searching for a specific genre."""

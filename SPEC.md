@@ -20,6 +20,13 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
     2. **Deduplicate**: Identify and list potential duplicates for user review.
     3. **Cleanup**: Remote tracks from "Liked Songs" after successful storage.
     4. **Manual Removal Tracking**: If a track is deleted from an A-Z playlist on Spotify, it is marked as `is_deleted` in the local DB during the next sync.
+- **Ingest Playlist Safety** (prevents duplicate playlists): If a letter's playlist is missing from the Spotify fetch, the system re-fetches the playlist list and then verifies the playlist ID stored in the DB for that letter. If the DB already has tracks for the letter but the playlist cannot be verified on Spotify, ingest **aborts for that letter** (tracks stay in "Liked Songs") instead of creating a possibly-duplicate playlist. A new playlist is only created when the DB has no tracks at all for that letter.
+- **Sync Deletion Safety** (prevents false mass-deletion):
+    - If the Spotify fetch returns no storage playlists or no tracks at all, sync **aborts deletion detection** (an empty read is never treated as evidence of mass removal).
+    - If more than 50% of the active DB tracks (minimum 10) appear to be missing from Spotify, the system prompts for action:
+      - `[y]es`: Mark the missing tracks as deleted.
+      - `[n]o`: Skip deletion for this run.
+      - `[r]esync`: Re-fetch the playlists once and re-evaluate (if the re-fetch is also empty, deletion detection is skipped).
 
 ### 2.2 Track Statistics
 
@@ -81,7 +88,16 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - **Interactive Review**: Always lists the "KEEP" and "DELETE" versions for user review before proceeding.
 - **Selection Logic**: Automatically proposes keeping the version with more play history or the oldest `added_at` date.
 
-### 4.2 Semantic Deduplication (findversions)
+### 4.2 Duplicate Copies (purgedupes)
+
+- **Add-Path Guard**: Every command that adds tracks to a playlist (ingest, canceldelete, canceladd, addartist, findnew, refill, phone history) first reads the target playlist's current track IDs and skips tracks that are already present, so the same track can never be added twice to the same playlist. Skipped (already-present) tracks are reported.
+- **purgedupes Command**: Removes duplicate *copies* of tracks from A-Z storage playlists (the same track listed multiple times within one playlist).
+    1. Scans all A-Z playlists and reports the duplicate count per playlist.
+    2. Shows a plan and asks for confirmation before removing anything.
+    3. Keeps the **first** copy of every track; only extra copies are removed. Spotify's `DELETE /playlists/{id}/tracks` endpoint currently **ignores** the `positions` field (a known API bug, spotipy#1098) and treats a named track as "remove **all** copies" (and a `snapshot_id` makes the call a no-op), so a true specific-occurrence removal is not possible. The purge therefore removes **all** copies of each duplicated track and re-adds it once at the position of its original first copy, keeping an in-memory model of the playlist so positions stay valid. Side effect: the re-added copy's "added at" timestamp is reset (a Spotify limitation of this workaround).
+    4. **Safety**: Aborts if the scan would remove at least as many copies as there are tracks (a broken scan can never empty a playlist); each track is structurally never removed without being re-added, and if the positioned re-add fails it falls back to appending at the end so the track is never lost; stops early if an API call fails; and verifies afterwards that every track is still present exactly once and no duplicates remain.
+
+### 4.3 Semantic Deduplication (findversions)
 
 - **Root Name Logic**: Uses regex to strip suffixes matching `ROOT_NAME_FORBIDDEN_KEYWORDS`.
 - **Bridge Workflow**:
@@ -129,6 +145,10 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - Interactively scans for duplicate playlists with the same name.
 - Allows the user to establish a primary ID and delete redundant duplicates from Spotify.
 - Provides an option to resync the local database state to the tracks in the established playlist.
+
+### 6.2 Duplicate Copy Purge (purgedupes)
+
+- Removes duplicate copies of tracks from A-Z storage playlists, keeping exactly one copy of each track. See section 4.2 for the full behavior and safety guarantees.
 
 ---
 
