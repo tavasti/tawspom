@@ -1,18 +1,58 @@
 import os
 import time
-from typing import List, Optional
+from collections import deque
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse, quote as urllib_parse_quote
 from dotenv import load_dotenv
+import requests
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException, SpotifyOauthError
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError
 from urllib3.exceptions import ProtocolError
+from urllib3.util.retry import Retry
 from tawspom.models import Track, Playlist
 from tawspom.core.db import get_meta, set_meta
-from tawspom.core.constants import SPOTIFY_PLAYLIST_BATCH_SIZE
+from tawspom.core.constants import (
+    SPOTIFY_API_TIMEOUT, SPOTIFY_MAX_RETRIES, SPOTIFY_RETRY_DELAY,
+    SPOTIFY_RATE_WINDOW_SECONDS, SPOTIFY_RATE_MAX_REQUESTS,
+    SPOTIFY_MAX_RETRY_AFTER_SECONDS, SPOTIFY_RETRY_AFTER_DEFAULT_SECONDS,
+    SPOTIFY_MAX_RATE_LIMIT_WAITS,
+)
 
 load_dotenv()
+
+class SpotifyRateLimitError(SpotifyException):
+    """Raised when Spotify's rate limit demands a wait beyond our cap.
+    The in-progress operation is safe to re-run: it resumes from the current state."""
+    def __init__(self, msg: str):
+        super().__init__(429, -1, msg)
+
+class _SlidingWindowRateLimiter:
+    """Paces calls so at most `max_requests` happen within any `window` seconds.
+
+    The Spotify Web API applies a rolling ~30s rate limit whose ceiling is not
+    published (dev-mode apps are low). Pacing client-side keeps us under the
+    limit, so 429s (and their long pauses) should not happen in the first place.
+    """
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self._calls: deque = deque()
+
+    def wait(self):
+        now = time.monotonic()
+        # Drop calls that have fallen out of the window
+        while self._calls and now - self._calls[0] >= self.window:
+            self._calls.popleft()
+        if len(self._calls) >= self.max_requests:
+            # Wait until the oldest call in the window falls out
+            time.sleep(self.window - (now - self._calls[0]))
+            now = time.monotonic()
+            while self._calls and now - self._calls[0] >= self.window:
+                self._calls.popleft()
+        self._calls.append(time.monotonic())
 
 class SpotifyClient:
     def __init__(self, user_label: str = "default", scope=None, db_conn=None):
@@ -35,15 +75,62 @@ class SpotifyClient:
                 cache_path=self._cache_path,
                 open_browser=False
             ),
-            requests_timeout=10
+            requests_timeout=SPOTIFY_API_TIMEOUT,
+            # spotipy's stub mis-annotates this as bool; it accepts a requests.Session
+            requests_session=self._build_session()  # type: ignore[arg-type]
         )
 
-    def _call_with_retry(self, func, *args, **kwargs):
-        """Wraps a Spotify API call with a retry mechanism for connection and auth errors."""
-        max_retries = 3
+    def _build_session(self) -> requests.Session:
+        """Builds a requests session that does NOT auto-sleep on 429.
+
+        spotipy's default urllib3 Retry treats 429 as retryable and sleeps for
+        the full Retry-After (which can be hours). We handle 429 ourselves in
+        _call_with_retry (bounded wait or clean stop), so 429 must raise
+        immediately; 5xx keep the usual short retries.
+        """
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            status=3,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE"]),
+            backoff_factor=0.3,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _throttle(self):
+        """Paces API calls to stay under Spotify's rolling rate limit.
+
+        The limiter state is created lazily so test clients built without
+        __init__ keep working.
+        """
+        limiter = getattr(self, "_rate_limiter", None)
+        if limiter is None:
+            limiter = self._rate_limiter = _SlidingWindowRateLimiter(
+                SPOTIFY_RATE_MAX_REQUESTS, SPOTIFY_RATE_WINDOW_SECONDS)
+        limiter.wait()
+
+    def _retry_after_seconds(self, exc: SpotifyException) -> float:
+        """Extracts the Retry-After header (seconds) from a 429 exception."""
+        raw = exc.headers.get("Retry-After") if exc.headers else None
+        if raw is None:
+            return float(SPOTIFY_RETRY_AFTER_DEFAULT_SECONDS)
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            return float(SPOTIFY_RETRY_AFTER_DEFAULT_SECONDS)
+
+    def _call_with_retry(self, func, *args, **kwargs) -> Any:
+        """Wraps a Spotify API call with a retry mechanism for connection, auth and rate-limit errors."""
+        max_retries = SPOTIFY_MAX_RETRIES
         reauth_done = False
+        rate_waits = 0
         for i in range(max_retries):
             try:
+                self._throttle()
                 return func(*args, **kwargs)
             except SpotifyOauthError as e:
                 # Handle expired refresh token (invalid_grant)
@@ -55,11 +142,35 @@ class SpotifyClient:
                     # Retry the original call with fresh token (one more attempt)
                     continue
                 raise
+            except SpotifyException as e:
+                if e.http_status != 429:
+                    raise
+                # Rate limit: honor Spotify's Retry-After, but never sit through a
+                # multi-hour pause — the command is resumable, so stopping cleanly
+                # is better than hanging.
+                retry_after = self._retry_after_seconds(e)
+                rate_waits += 1
+                if retry_after > SPOTIFY_MAX_RETRY_AFTER_SECONDS or rate_waits > SPOTIFY_MAX_RATE_LIMIT_WAITS:
+                    raise SpotifyRateLimitError(
+                        f"Spotify rate limit reached (Retry-After: {retry_after:.0f}s). "
+                        "Nothing was lost — re-run the command later and it will continue "
+                        "from the current state."
+                    ) from e
+                if i == max_retries - 1:
+                    # No retry iteration left; stop cleanly instead of returning None
+                    raise SpotifyRateLimitError(
+                        "Spotify rate limit reached repeatedly; stopping. Nothing was lost — "
+                        "re-run the command later."
+                    ) from e
+                print(f"\n⏳ Spotify rate limit reached; waiting {retry_after:.0f}s before retrying "
+                      f"({rate_waits}/{SPOTIFY_MAX_RATE_LIMIT_WAITS})...")
+                time.sleep(retry_after)
+                continue
             except (ConnectionError, ProtocolError) as e:
                 if i == max_retries - 1:
                     raise
-                print(f"\nConnection error: {e}. Retrying in 2 seconds... (Attempt {i+1}/{max_retries})")
-                time.sleep(2)
+                print(f"\nConnection error: {e}. Retrying in {SPOTIFY_RETRY_DELAY} seconds... (Attempt {i+1}/{max_retries})")
+                time.sleep(SPOTIFY_RETRY_DELAY)
                 self._init_sp()
         return None
 
@@ -111,13 +222,14 @@ class SpotifyClient:
 
         # Exchange the authorization code for a new token (spotipy caches it automatically)
         self._init_sp()
+        assert self.sp.auth_manager is not None  # always set by _init_sp
         self.sp.auth_manager.get_access_token(code)
         print("\n✅ Authorization successful!\n")
 
         # Re-initialize so the cached token is loaded properly
         self._init_sp()
 
-    def get_storage_playlists(self) -> List[Playlist]:
+    def get_storage_playlists(self) -> list[Playlist]:
         """Fetches all playlists that have a single-character name (A-Z)."""
         playlists = []
         offset = 0
@@ -136,7 +248,7 @@ class SpotifyClient:
 
         return playlists
 
-    def search_artist(self, name: str) -> List[dict]:
+    def search_artist(self, name: str) -> list[dict]:
         """Returns a list of the top 30 artists found matching the name, including top tracks."""
         results = self._call_with_retry(self.sp.search, q=f"artist:{name}", type="artist", limit=30)
         items = results.get("artists", {}).get("items", [])
@@ -156,8 +268,10 @@ class SpotifyClient:
             })
         return artists
 
-    def get_artist_albums(self, artist_id: str, types: List[str] = ["album"]) -> List[dict]:
+    def get_artist_albums(self, artist_id: str, types: list[str] | None = None) -> list[dict]:
         """Fetches albums/singles, including release date."""
+        if types is None:
+            types = ["album"]
         albums = []
         offset = 0
         album_types = ",".join(types)
@@ -189,7 +303,7 @@ class SpotifyClient:
         res = self._call_with_retry(self.sp.user_playlist_create, user_id, name, public=False)
         return Playlist(res["id"], res["name"])
 
-    def get_album_tracks(self, album_id: str, album_name: str = "") -> List[Track]:
+    def get_album_tracks(self, album_id: str, album_name: str = "") -> list[Track]:
         """Fetches all tracks for a specific album."""
         tracks = []
         offset = 0
@@ -211,7 +325,7 @@ class SpotifyClient:
             offset += 50
         return tracks
 
-    def get_playlist_tracks(self, playlist_id: str) -> List[Track]:
+    def get_playlist_tracks(self, playlist_id: str) -> list[Track]:
         """Fetches all tracks from a given playlist."""
         tracks = []
         offset = 0
@@ -267,7 +381,7 @@ class SpotifyClient:
             offset += limit
         return total_ms
 
-    def get_liked_songs(self) -> List[Track]:
+    def get_liked_songs(self) -> list[Track]:
         """Fetches all tracks from 'Liked Songs'."""
         tracks = []
         offset = 0
@@ -294,7 +408,7 @@ class SpotifyClient:
             offset += limit
         return tracks
 
-    def remove_liked_songs(self, track_ids: List[str]):
+    def remove_liked_songs(self, track_ids: list[str]):
         """Removes tracks from 'Liked Songs'. Using safe batch size of 20."""
         if not track_ids: return
         for i in range(0, len(track_ids), 20):
@@ -393,14 +507,14 @@ class SpotifyClient:
         """Returns the currently playing track ID and context."""
         return self._call_with_retry(self.sp.current_playback)
 
-    def remove_tracks_from_playlist(self, playlist_id: str, track_ids: List[str]):
+    def remove_tracks_from_playlist(self, playlist_id: str, track_ids: list[str]):
         """Removes a list of tracks from a playlist."""
         if not track_ids:
             return
         for i in range(0, len(track_ids), 100):
             self._call_with_retry(self.sp.playlist_remove_all_occurrences_of_items, playlist_id, track_ids[i:i+100])
 
-    def add_tracks_to_playlist(self, playlist_id: str, track_ids: List[str]):
+    def add_tracks_to_playlist(self, playlist_id: str, track_ids: list[str]):
         """Adds a list of tracks to a playlist."""
         if not track_ids:
             return
@@ -420,7 +534,7 @@ class SpotifyClient:
             self.add_tracks_to_playlist(playlist_id, to_add)
         return to_add, skipped
 
-    def get_playlist_tracks_ordered(self, playlist_id: str) -> List[str]:
+    def get_playlist_tracks_ordered(self, playlist_id: str) -> list[str]:
         """Returns track IDs in the order they appear in the playlist."""
         track_ids = []
         offset = 0
@@ -434,91 +548,17 @@ class SpotifyClient:
             offset += limit
         return track_ids
 
-    def get_playlist_items_with_positions(self, playlist_id: str) -> list[tuple[int, str]]:
-        """Fetches a playlist as [(position, track_id), ...], zero-based positions
-        in current playlist order."""
-        items: list[tuple[int, str]] = []
-        offset = 0
-        limit = SPOTIFY_PLAYLIST_BATCH_SIZE
-        while True:
-            result = self._call_with_retry(
-                self.sp.playlist_items, playlist_id,
-                fields="items(track(id))", limit=limit, offset=offset
-            )
-            if not result:
-                break
-            page = result.get("items", [])
-            for idx, item in enumerate(page):
-                t = item.get("track")
-                if t:
-                    items.append((offset + idx, t["id"]))
-            if len(page) < limit:
-                break
-            offset += limit
-        return items
+    def clear_playlist(self, playlist_id: str):
+        """Removes all items from a playlist (replaces its contents with an empty list)."""
+        self._call_with_retry(self.sp.playlist_replace_items, playlist_id, [])
 
-    def remove_playlist_duplicates(self, playlist_id: str) -> int:
-        """Remove all duplicate occurrences from a playlist, keeping the first copy of each track.
-
-        Spotify's ``DELETE /playlists/{id}/tracks`` endpoint currently IGNORES the
-        ``positions`` field (a known API bug, spotipy#1098): naming a track removes
-        ALL of its copies, and passing a ``snapshot_id`` makes the call a no-op. So a
-        true "remove this specific occurrence" is not possible via the API.
-
-        The reliable workaround is: for each duplicated track, remove ALL of its
-        copies, then re-add the track once at the position of its original first
-        copy. This leaves exactly one copy (at the first copy's position) and never
-        removes a track entirely.
-
-        Side effect: re-adding a track resets its "added at" timestamp (a Spotify
-        limitation of this workaround).
-
-        Returns the number of extra copies removed.
-        """
-        tracks = self.get_playlist_tracks_ordered(playlist_id)
-        if not tracks:
-            return 0
-
-        # In-memory model of the playlist, kept in sync as duplicates are collapsed.
-        model = list(tracks)
-        full = {tid: f"spotify:track:{tid}" for tid in set(model)}
-        removed = 0
-        while True:
-            # Find any track that still has more than one copy.
-            counts: dict[str, int] = {}
-            for tid in model:
-                counts[tid] = counts.get(tid, 0) + 1
-            dup = next((t for t, c in counts.items() if c > 1), None)
-            if dup is None:
-                break
-            pos = model.index(dup)  # first-copy position in the current model
-            # Remove every copy, then re-add once at the first copy's position.
-            if self._call_with_retry(
-                self.sp.playlist_remove_all_occurrences_of_items, playlist_id, [full[dup]]
-            ) is None:
-                print(f"  ⚠️  Removal failed for {dup[:8]}…; stopping early with {removed} removed so far.")
-                break
-            readd = self._call_with_retry(
-                self.sp.playlist_add_items, playlist_id, [full[dup]], position=pos
-            )
-            if readd is None:
-                # Fallback: append at the end rather than lose the track entirely.
-                readd = self._call_with_retry(self.sp.playlist_add_items, playlist_id, [full[dup]])
-            if readd is None:
-                print(f"  ⚠️  Could not re-add {dup[:8]}… after removal — track may be missing!")
-                break
-            model = [t for t in model if t != dup]
-            model.insert(pos, dup)
-            removed += counts[dup] - 1
-        return removed
-
-    def search_artists_by_genre(self, genre: str, limit: int = 50) -> List[dict]:
+    def search_artists_by_genre(self, genre: str, limit: int = 50) -> list[dict]:
         """Discovers artists by searching for a specific genre."""
         query = f"genre:\"{genre}\""
         res = self._call_with_retry(self.sp.search, q=query, type="artist", limit=limit)
         return res.get("artists", {}).get("items", []) if res else []
 
-    def get_artist_top_tracks(self, artist_id: str, country: str = 'US') -> List[dict]:
+    def get_artist_top_tracks(self, artist_id: str, country: str = 'US') -> list[dict]:
         """Fetches top tracks for an artist."""
         res = self._call_with_retry(self.sp.artist_top_tracks, artist_id, country=country)
         return res.get("tracks", []) if res else []

@@ -2,7 +2,7 @@ import argparse
 import sys
 import os
 from tawspom.core.db import init_db
-from tawspom.core.spotify import SpotifyClient
+from tawspom.core.spotify import SpotifyClient, SpotifyRateLimitError
 from tawspom.core.manager import Manager
 from tawspom.core.constants import (
     DEFAULT_REFILL_HOURS, RADIO_DEFAULT_MAIN_COUNT, RADIO_DEFAULT_PER_ARTIST,
@@ -32,7 +32,9 @@ def main():
     subparsers.add_parser("processversions", help="Process the 'Duplicate Review' playlist and delete removed tracks")
     subparsers.add_parser("findnew", help=f"Find new albums from artists you have listened to (>= {FINDNEW_QUALIFY_MIN_TRACKS} songs)")
     subparsers.add_parser("fixplaylists", help="Interactively resolve and clean up duplicate playlists")
-    subparsers.add_parser("purgedupes", help="Remove duplicate copies of tracks from A-Z storage playlists (keeps one copy of each)")
+
+    recreate_parser = subparsers.add_parser("recreate", help="Rebuild one storage playlist (A-Z) so it exactly matches the database (recovery tool; run sync first)")
+    recreate_parser.add_argument("letter", help="Storage playlist letter (A-Z)")
 
     # Radio
     radio_parser = subparsers.add_parser("artistradio", help="Create a custom artist radio playlist")
@@ -108,8 +110,8 @@ def main():
         manager.find_new_music()
     elif args.command == "fixplaylists":
         manager.fix_duplicate_playlists([ACTIVE_PLAYLIST_NAME, PHONE_PLAYLIST_NAME])
-    elif args.command == "purgedupes":
-        manager.purge_storage_duplicates()
+    elif args.command == "recreate":
+        manager.recreate_storage_playlist(args.letter)
     elif args.command == "artistradio":
         manager.create_artist_radio(args.name, args.main_count, args.filter, args.per_artist)
     elif args.command == "addartist":
@@ -142,4 +144,8 @@ def main():
         manager.refill_active_playlist(ACTIVE_PLAYLIST_NAME, args.hours, mode=mode, phone_playlist_name=PHONE_PLAYLIST_NAME)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SpotifyRateLimitError as e:
+        print(f"\n⏳ {e}")
+        sys.exit(1)

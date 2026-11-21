@@ -1,13 +1,19 @@
-"""Tests for the duplicate-prevention and duplicate-purge logic.
+"""Tests for duplicate prevention and sync safety.
 
 Covers the fixes for:
 - Bug 1: ingest must not create a duplicate storage playlist when the DB
   already has tracks for the letter (_resolve_storage_playlist).
+- Bug 2: sync must not mass-delete tracks when a playlist read collapsed
+  (partial API glitch) — suspicious playlists are detected and the user
+  decides (_find_suspicious_playlists).
 - Bug 3a: no add path may add a track that is already in the target
   playlist (add_tracks_to_playlist_unique).
-- Bug 3b: purging duplicates must keep exactly one copy of every track
-  and never remove the last copy (remove_playlist_duplicates,
-  purge_storage_duplicates).
+- Bug 3b: 'recreate' rebuilds one storage playlist from the DB with
+  pre-clear verification, rescue of misplaced tracks, and post-refill
+  verification (recreate_storage_playlist).
+- Rate limiting: 429 handling must wait bounded times and stop cleanly
+  beyond the cap, so interrupted commands can be re-run to resume
+  (_call_with_retry).
 
 Run with:  python -m unittest tests.test_playlist_manager -v
 
@@ -20,9 +26,11 @@ compatibility checks are disabled for this file only.
 import unittest
 from unittest.mock import Mock, call, patch
 
+from spotipy.exceptions import SpotifyException
+
 from tawspom.core.manager import Manager
-from tawspom.core.spotify import SpotifyClient
-from tawspom.models import Playlist
+from tawspom.core.spotify import SpotifyClient, SpotifyRateLimitError
+from tawspom.models import Playlist, Track
 
 
 def make_sp_client():
@@ -39,6 +47,13 @@ def make_manager():
     mgr.sp = Mock()
     mgr.db = Mock()
     return mgr
+
+
+def make_track(tid, name, storage_playlist_id="p1", is_deleted=False):
+    """Builds a minimal Track for tests."""
+    return Track(id=tid, name=name, artist="Artist", album="Album",
+                 duration_ms=200000, storage_playlist_id=storage_playlist_id,
+                 is_deleted=is_deleted)
 
 
 class TestAddTracksUnique(unittest.TestCase):
@@ -89,135 +104,219 @@ class TestAddTracksUnique(unittest.TestCase):
         client.add_tracks_to_playlist.assert_not_called()
 
 
-class TestRemovePlaylistDuplicates(unittest.TestCase):
-    """Bug 3b: purge engine - keeps the first copy, never removes the last copy."""
+class TestRecreateStoragePlaylist(unittest.TestCase):
+    """Bug 3b: 'recreate' rebuilds one storage playlist from the DB, safely."""
 
-    def _client_with_tracks(self, tracks):
-        """tracks: the playlist contents as a list of track ids (single read)."""
-        client = make_sp_client()
-        client.get_playlist_tracks_ordered = Mock(return_value=list(tracks))
-        client.sp.playlist_remove_all_occurrences_of_items.return_value = {}
-        client.sp.playlist_add_items.return_value = {}
-        return client
+    def test_invalid_letter_rejected(self):
+        for bad in ("", "AB", "1", "Ä"):
+            with self.subTest(bad=bad):
+                mgr = make_manager()
+                mgr.recreate_storage_playlist(bad)
+                mgr.sp.get_storage_playlists.assert_not_called()
 
-    def test_keeps_first_copy_removes_extras(self):
-        # a@0,2  b@1,3 -> keep a@0, b@1; remove the extras.
-        client = self._client_with_tracks(["a", "b", "a", "b"])
-
-        removed = client.remove_playlist_duplicates("pl")
-
-        self.assertEqual(removed, 2)
-        # Each duplicated track is fully removed, then re-added once at its first position.
-        removed_uris = [c[0][1] for c in client.sp.playlist_remove_all_occurrences_of_items.call_args_list]
-        self.assertEqual(removed_uris, [["spotify:track:a"], ["spotify:track:b"]])
-        readds = client.sp.playlist_add_items.call_args_list
-        self.assertEqual(readds[0], call("pl", ["spotify:track:a"], position=0))
-        self.assertEqual(readds[1], call("pl", ["spotify:track:b"], position=1))
-
-    def test_no_duplicates_no_removal(self):
-        client = self._client_with_tracks(["a", "b"])
-
-        removed = client.remove_playlist_duplicates("pl")
-
-        self.assertEqual(removed, 0)
-        client.sp.playlist_remove_all_occurrences_of_items.assert_not_called()
-        client.sp.playlist_add_items.assert_not_called()
-        self.assertEqual(client.get_playlist_tracks_ordered.call_count, 1)
-
-    def test_empty_playlist(self):
-        client = self._client_with_tracks([])
-        self.assertEqual(client.remove_playlist_duplicates("pl"), 0)
-        client.sp.playlist_remove_all_occurrences_of_items.assert_not_called()
-
-    def test_single_track_never_removed(self):
-        """A track that appears exactly once must never be removed."""
-        client = self._client_with_tracks(["only", "dup", "dup"])
-
-        removed = client.remove_playlist_duplicates("pl")
-
-        self.assertEqual(removed, 1)
-        removed_uris = [c[0][1] for c in client.sp.playlist_remove_all_occurrences_of_items.call_args_list]
-        self.assertEqual(removed_uris, [["spotify:track:dup"]])
-        self.assertEqual(client.sp.playlist_add_items.call_args_list,
-                         [call("pl", ["spotify:track:dup"], position=1)])
-
-    def test_api_failure_stops_early(self):
-        client = self._client_with_tracks(["a", "a"])
-        client.sp.playlist_remove_all_occurrences_of_items.return_value = None
-
-        removed = client.remove_playlist_duplicates("pl")
-
-        self.assertEqual(removed, 0)  # nothing confirmed removed
-        # Must not loop forever after a failed call
-        self.assertEqual(client.sp.playlist_remove_all_occurrences_of_items.call_count, 1)
-        client.sp.playlist_add_items.assert_not_called()
-
-    def test_readd_fallback_appends_on_positioned_failure(self):
-        """If the positioned re-add fails, append at the end so the track is not lost."""
-        client = self._client_with_tracks(["a", "a"])
-        # First add (with position) fails; the fallback add (no position) succeeds.
-        client.sp.playlist_add_items.side_effect = [None, {}]
-
-        removed = client.remove_playlist_duplicates("pl")
-
-        self.assertEqual(removed, 1)
-        self.assertEqual(client.sp.playlist_add_items.call_count, 2)
-        self.assertEqual(client.sp.playlist_add_items.call_args_list[1],
-                         call("pl", ["spotify:track:a"]))
-
-
-class TestPurgeStorageDuplicates(unittest.TestCase):
-    """Bug 3b: manager-level purge with plan/confirm/verify."""
-
-    def _manager_with_playlists(self, playlists, items_by_id):
+    def test_duplicate_target_playlists_abort(self):
         mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = playlists
-        mgr.sp.get_playlist_items_with_positions.side_effect = (
-            lambda pl_id: items_by_id[pl_id]
-        )
-        mgr.sp.remove_playlist_duplicates.return_value = 0
-        return mgr
+        mgr.sp.get_storage_playlists.return_value = [Playlist("x1", "A"), Playlist("x2", "A")]
+        mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
 
-    def test_no_duplicates_no_removal(self):
-        mgr = self._manager_with_playlists(
-            [Playlist("p1", "A")],
-            {"p1": [(0, "a"), (1, "b")]},
-        )
-
-        mgr.purge_storage_duplicates()
-
-        mgr.sp.remove_playlist_duplicates.assert_not_called()
-
-    def test_no_storage_playlists(self):
+    def test_missing_playlist_declined(self):
         mgr = make_manager()
         mgr.sp.get_storage_playlists.return_value = []
-        mgr.purge_storage_duplicates()
-        mgr.sp.remove_playlist_duplicates.assert_not_called()
-
-    def test_cancelled_by_user(self):
-        mgr = self._manager_with_playlists(
-            [Playlist("p1", "A")],
-            {"p1": [(0, "a"), (1, "a")]},
-        )
         with patch("builtins.input", return_value="n"):
-            mgr.purge_storage_duplicates()
-        mgr.sp.remove_playlist_duplicates.assert_not_called()
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.create_playlist.assert_not_called()
+        mgr.sp.clear_playlist.assert_not_called()
 
-    def test_confirmed_removes_from_each_playlist_with_dups(self):
-        mgr = self._manager_with_playlists(
-            [Playlist("p1", "A"), Playlist("p2", "B")],
-            {
-                "p1": [(0, "a"), (1, "a"), (2, "b")],  # 1 dup
-                "p2": [(0, "c")],                      # no dups
-            },
-        )
-        mgr.sp.remove_playlist_duplicates.side_effect = lambda pl_id: 1 if pl_id == "p1" else 0
+    def test_happy_path_with_dup_misplaced_and_missing(self):
+        """Dups removed, misplaced track rescued, missing track added, DB normalized."""
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A"), Playlist("p2", "B")]
+        # reads: target 'A' content, rescue target 'B' content, final verification
+        mgr.sp.get_playlist_tracks_ordered.side_effect = [
+            ["a1", "a2", "b1", "a1"],
+            ["b2"],
+            ["a1", "a2", "a3"],
+        ]
+        tracks = [make_track("a1", "Alpha"), make_track("a2", "Act"),
+                  make_track("a3", "Apple"), make_track("b1", "Beta", "p2")]
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks), \
+             patch("tawspom.core.manager.update_storage_playlist_id") as upd, \
+             patch("builtins.input", return_value="y"):
+            mgr.recreate_storage_playlist("A")
 
-        with patch("builtins.input", return_value="y"):
-            mgr.purge_storage_duplicates()
+        mgr.sp.clear_playlist.assert_called_once_with("p1")
+        add_calls = mgr.sp.add_tracks_to_playlist.call_args_list
+        self.assertIn(call("p2", ["b1"]), add_calls)            # rescue
+        self.assertIn(call("p1", ["a1", "a2", "a3"]), add_calls)  # refill
+        upd.assert_any_call(mgr.db, ["a1", "a2", "a3"], "p1")
+        upd.assert_any_call(mgr.db, ["b1"], "p2")
 
-        # Only the playlist that actually had duplicates is purged
-        mgr.sp.remove_playlist_duplicates.assert_called_once_with("p1")
+    def test_unknown_track_aborts_before_clear(self):
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "ghost"]
+        tracks = [make_track("a1", "Alpha")]
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
+
+    def test_deleted_track_aborts_before_clear(self):
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "gone"]
+        a1 = make_track("a1", "Alpha")
+        gone = make_track("gone", "Gone", is_deleted=True)
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[a1, gone]):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+
+    def test_rescue_target_unresolvable_aborts(self):
+        """Misplaced track whose own letter has no playlist: abort, don't lose it."""
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]  # no 'B'
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "b1"]
+        tracks = [make_track("a1", "Alpha"), make_track("b1", "Beta", "p2")]
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
+
+    def test_declined_confirmation_changes_nothing(self):
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1"]
+        tracks = [make_track("a1", "Alpha")]
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks), \
+             patch("builtins.input", return_value="n"):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
+
+    def test_missing_playlist_created_and_refilled(self):
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = []
+        mgr.sp.create_playlist.return_value = Playlist("new1", "A")
+        # reads: new playlist content (empty), final verification
+        mgr.sp.get_playlist_tracks_ordered.side_effect = [[], ["a1"]]
+        tracks = [make_track("a1", "Alpha")]
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[]), \
+             patch("tawspom.core.manager.update_storage_playlist_id") as upd, \
+             patch("builtins.input", side_effect=["y", "y"]):
+            mgr.recreate_storage_playlist("a")  # lowercase is normalized
+
+        mgr.sp.create_playlist.assert_called_once_with("A")
+        mgr.sp.clear_playlist.assert_called_once_with("new1")
+        mgr.sp.add_tracks_to_playlist.assert_called_once_with("new1", ["a1"])
+        upd.assert_called_once_with(mgr.db, ["a1"], "new1")
+
+    def test_empty_playlist_and_empty_db_noop(self):
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = []
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[]):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
+
+
+class TestFindSuspiciousPlaylists(unittest.TestCase):
+    """Bug 2: sync guard for collapsed playlist reads (partial API glitches)."""
+
+    def test_collapsed_read_is_suspicious(self):
+        mgr = make_manager()
+        stats = [
+            {"id": "p1", "name": "A", "count": 10, "duration": 0},
+            {"id": "p2", "name": "B", "count": 90, "duration": 0},
+        ]
+        with patch("tawspom.core.manager.get_playlist_track_count",
+                   side_effect=lambda db, pl_id: {"p1": 100, "p2": 100}[pl_id]):
+            ids, detail = mgr._find_suspicious_playlists(stats)
+        self.assertEqual(ids, {"p1"})
+        self.assertEqual(detail, [("A", 10, 100)])
+
+    def test_full_read_not_suspicious(self):
+        mgr = make_manager()
+        stats = [{"id": "p1", "name": "A", "count": 100, "duration": 0}]
+        with patch("tawspom.core.manager.get_playlist_track_count", return_value=100):
+            ids, detail = mgr._find_suspicious_playlists(stats)
+        self.assertEqual((ids, detail), (set(), []))
+
+    def test_empty_db_not_suspicious(self):
+        """A playlist the DB knows nothing about cannot 'collapse'."""
+        mgr = make_manager()
+        stats = [{"id": "p1", "name": "A", "count": 0, "duration": 0}]
+        with patch("tawspom.core.manager.get_playlist_track_count", return_value=0):
+            ids, detail = mgr._find_suspicious_playlists(stats)
+        self.assertEqual((ids, detail), (set(), []))
+
+    def test_boundary_half_not_suspicious(self):
+        """Exactly half the DB count is still a trustworthy read."""
+        mgr = make_manager()
+        stats = [{"id": "p1", "name": "A", "count": 50, "duration": 0}]
+        with patch("tawspom.core.manager.get_playlist_track_count", return_value=100):
+            ids, detail = mgr._find_suspicious_playlists(stats)
+        self.assertEqual((ids, detail), (set(), []))
+
+
+class TestRateLimitHandling(unittest.TestCase):
+    """429 handling: bounded waits, clean stop beyond the cap, resumable."""
+
+    def test_large_retry_after_stops_cleanly(self):
+        """A multi-hour Retry-After must not be sat through — stop cleanly."""
+        client = make_sp_client()
+        exc = SpotifyException(429, 0, "rate limited", headers={"Retry-After": "999999"})
+        client.sp.api_call = Mock(side_effect=exc)
+        with patch("tawspom.core.spotify.time.sleep") as sl, \
+             self.assertRaises(SpotifyRateLimitError):
+            client._call_with_retry(client.sp.api_call)
+        self.assertEqual(client.sp.api_call.call_count, 1)
+        sl.assert_not_called()
+
+    def test_small_retry_after_waits_and_recovers(self):
+        client = make_sp_client()
+        exc = SpotifyException(429, 0, "rate limited", headers={"Retry-After": "2"})
+        ok = {"ok": True}
+        client.sp.api_call = Mock(side_effect=[exc, ok])
+        with patch("tawspom.core.spotify.time.sleep") as sl:
+            result = client._call_with_retry(client.sp.api_call)
+        self.assertEqual(result, ok)
+        sl.assert_called_once_with(2.0)
+
+    def test_missing_retry_after_uses_default(self):
+        client = make_sp_client()
+        exc = SpotifyException(429, 0, "rate limited")
+        client.sp.api_call = Mock(side_effect=[exc, "ok"])
+        with patch("tawspom.core.spotify.time.sleep") as sl:
+            result = client._call_with_retry(client.sp.api_call)
+        self.assertEqual(result, "ok")
+        sl.assert_called_once_with(30.0)
+
+    def test_repeated_429_beyond_retry_budget_stops(self):
+        client = make_sp_client()
+        exc = SpotifyException(429, 0, "rate limited", headers={"Retry-After": "2"})
+        client.sp.api_call = Mock(side_effect=exc)
+        with patch("tawspom.core.spotify.time.sleep") as sl, \
+             self.assertRaises(SpotifyRateLimitError):
+            client._call_with_retry(client.sp.api_call)
+        # SPOTIFY_MAX_RETRIES=3: two waits, then a clean stop on the last iteration
+        self.assertEqual(sl.call_count, 2)
+
+    def test_non_429_raises_immediately(self):
+        client = make_sp_client()
+        exc = SpotifyException(500, 1, "server error")
+        client.sp.api_call = Mock(side_effect=exc)
+        with self.assertRaises(SpotifyException):
+            client._call_with_retry(client.sp.api_call)
+        self.assertEqual(client.sp.api_call.call_count, 1)
 
 
 class TestResolveStoragePlaylist(unittest.TestCase):

@@ -4,6 +4,8 @@ def test_auth():
     try:
         client = SpotifyClient()
         user = client.sp.current_user()
+        if not user:
+            raise RuntimeError("Spotify current_user() returned no user")
         print(f"\nSuccessfully authenticated!")
         print(f"User Display Name: {user['display_name']}")
         print(f"User ID: {user['id']}")

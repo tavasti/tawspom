@@ -23,6 +23,10 @@ Tawspom is a tool for power users who maintain massive Spotify libraries (20k+ t
 - **Ingest Playlist Safety** (prevents duplicate playlists): If a letter's playlist is missing from the Spotify fetch, the system re-fetches the playlist list and then verifies the playlist ID stored in the DB for that letter. If the DB already has tracks for the letter but the playlist cannot be verified on Spotify, ingest **aborts for that letter** (tracks stay in "Liked Songs") instead of creating a possibly-duplicate playlist. A new playlist is only created when the DB has no tracks at all for that letter.
 - **Sync Deletion Safety** (prevents false mass-deletion):
     - If the Spotify fetch returns no storage playlists or no tracks at all, sync **aborts deletion detection** (an empty read is never treated as evidence of mass removal).
+    - **Per-playlist short-read guard**: a playlist whose read track count is less than 50% of the count the DB holds for it is considered *suspicious* (usually a partial read from a transient API glitch, not a real removal). Missing tracks mapped to suspicious playlists are never silently marked deleted — the system prompts for action:
+      - `[y]es`: Mark the missing tracks as deleted (the global mass check below still applies).
+      - `[n]o`: Skip deletion for this run.
+      - `[r]esync`: Re-fetch the playlists once and re-evaluate (if the re-fetch is also empty, deletion detection is skipped).
     - If more than 50% of the active DB tracks (minimum 10) appear to be missing from Spotify, the system prompts for action:
       - `[y]es`: Mark the missing tracks as deleted.
       - `[n]o`: Skip deletion for this run.
@@ -88,14 +92,17 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - **Interactive Review**: Always lists the "KEEP" and "DELETE" versions for user review before proceeding.
 - **Selection Logic**: Automatically proposes keeping the version with more play history or the oldest `added_at` date.
 
-### 4.2 Duplicate Copies (purgedupes)
+### 4.2 Duplicate Copies (recreate)
 
 - **Add-Path Guard**: Every command that adds tracks to a playlist (ingest, canceldelete, canceladd, addartist, findnew, refill, phone history) first reads the target playlist's current track IDs and skips tracks that are already present, so the same track can never be added twice to the same playlist. Skipped (already-present) tracks are reported.
-- **purgedupes Command**: Removes duplicate *copies* of tracks from A-Z storage playlists (the same track listed multiple times within one playlist).
-    1. Scans all A-Z playlists and reports the duplicate count per playlist.
-    2. Shows a plan and asks for confirmation before removing anything.
-    3. Keeps the **first** copy of every track; only extra copies are removed. Spotify's `DELETE /playlists/{id}/tracks` endpoint currently **ignores** the `positions` field (a known API bug, spotipy#1098) and treats a named track as "remove **all** copies" (and a `snapshot_id` makes the call a no-op), so a true specific-occurrence removal is not possible. The purge therefore removes **all** copies of each duplicated track and re-adds it once at the position of its original first copy, keeping an in-memory model of the playlist so positions stay valid. Side effect: the re-added copy's "added at" timestamp is reset (a Spotify limitation of this workaround).
-    4. **Safety**: Aborts if the scan would remove at least as many copies as there are tracks (a broken scan can never empty a playlist); each track is structurally never removed without being re-added, and if the positioned re-add fails it falls back to appending at the end so the track is never lost; stops early if an API call fails; and verifies afterwards that every track is still present exactly once and no duplicates remain.
+- **recreate Command**: Rebuilds a single A-Z storage playlist so it exactly matches the DB's active tracks for that letter (recovery tool for duplicated, corrupted, or misplaced playlist content; also moves a collection to a different Spotify account).
+    1. Usage: `recreate <letter>` (a single A-Z letter).
+    2. **Refill set**: every active DB track whose name maps to that letter — computed by letter, not by stored playlist ID, which is what makes account moves work.
+    3. **Pre-clear verification**: before anything is removed, every track currently in the playlist must resolve in the DB. Unknown (not in DB) or deleted tracks **abort the operation before anything is touched**.
+    4. **Rescue**: tracks that belong to a different letter are first added to that letter's own playlist (aborts if that playlist cannot be uniquely resolved), so the clear cannot lose them.
+    5. After a summary and a single confirmation: the playlist is cleared and refilled with the refill set, and the DB mapping of the refilled (and rescued) tracks is normalized to the target playlist ID.
+    6. **Post-refill verification**: the playlist is re-read and compared against the refill set; any mismatch is reported as a warning.
+    - **Safety**: one confirmation per run; aborts if the target letter resolves to multiple playlists; a missing playlist is only created with explicit confirmation; never touches DB deletion state (the DB is the source of truth — run `sync` first if it is not current).
 
 ### 4.3 Semantic Deduplication (findversions)
 
@@ -146,9 +153,9 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 - Allows the user to establish a primary ID and delete redundant duplicates from Spotify.
 - Provides an option to resync the local database state to the tracks in the established playlist.
 
-### 6.2 Duplicate Copy Purge (purgedupes)
+### 6.2 Storage Playlist Recreation (recreate)
 
-- Removes duplicate copies of tracks from A-Z storage playlists, keeping exactly one copy of each track. See section 4.2 for the full behavior and safety guarantees.
+- Rebuilds a single A-Z storage playlist so it exactly matches the DB's active tracks for that letter, with pre-clear verification and post-refill verification. See section 4.2 for the full behavior and safety guarantees.
 
 ---
 
@@ -160,8 +167,11 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
   - Liked Songs: `SPOTIFY_LIKED_SONGS_BATCH_SIZE` (Default: 20).
 - **API Wrapper**: A centralized `_call_with_retry` function handles:
   - **Connection errors** (`ConnectionError`, `ProtocolError`): Retries up to `SPOTIFY_MAX_RETRIES` (3) with `SPOTIFY_RETRY_DELAY` (2s) between attempts, re-initializing the client each time.
+  - **Rate limiting (HTTP 429)**: Honors the `Retry-After` header but never sits through a multi-hour pause — if `Retry-After` exceeds `SPOTIFY_MAX_RETRY_AFTER_SECONDS` (600), or more than `SPOTIFY_MAX_RATE_LIMIT_WAITS` (3) rate-limit waits happen within one call, `_call_with_retry` raises `SpotifyRateLimitError` instead of hanging. The command entry points catch it and exit cleanly with a message; the command is **resumable** — re-running it continues from the current state (the add-path guard prevents double-adding).
+  - **Other HTTP errors**: 5xx responses are retried at the HTTP session level (urllib3 `Retry`, 3 attempts, backoff 0.3); any other `SpotifyException` propagates immediately.
   - **OAuth errors** (`SpotifyOauthError`):
     - `invalid_grant` (expired refresh token): Deletes the stale token cache, prints the authorization URL, prompts the user to paste the redirect URL, exchanges the code for a fresh token, and retries the original API call once. Non-`invalid_grant` OAuth errors are propagated unchanged.
+- **Throttling**: Every API call passes through a sliding-window rate limiter (`SPOTIFY_RATE_MAX_REQUESTS` (100) calls per `SPOTIFY_RATE_WINDOW_SECONDS` (30)), keeping the client under Spotify's rolling rate limit even during long bulk operations.
 - **API Timeout**: Configured via `SPOTIFY_API_TIMEOUT` (Default: 10s).
 - **Token Cache**: OAuth tokens are persisted to `~/.tawspom/token_{user_label}.json`. The `--user` CLI flag controls which cache file is used (default: `default`). Spotify refresh tokens expire after 6 months (policy effective July 2026); upon `invalid_grant`, the stale cache is deleted and the user is guided through re-authentication.
 - **Environment**: Configuration via `.env` file.

@@ -16,6 +16,7 @@ class Track:
     is_deleted: bool = False
     add_transaction_id: Optional[int] = None
     delete_transaction_id: Optional[int] = None
+    play_count: int = 0
 
 @dataclass
 class Transaction:

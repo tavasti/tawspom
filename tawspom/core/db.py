@@ -179,14 +179,16 @@ def mark_tracks_deleted(conn, track_ids: List[str], transaction_id: int):
     if not track_ids: return
     cur = conn.cursor()
     now = datetime.now().isoformat()
-    cur.execute(f"UPDATE track SET is_deleted = 1, deleted_at = ?, delete_transaction_id = ? WHERE id IN ({','.join(['?']*len(track_ids))})", 
-                [now, transaction_id] + track_ids)
+    # Per-id parameterized statements: no dynamic SQL, no SQLite variable limit
+    cur.executemany("UPDATE track SET is_deleted = 1, deleted_at = ?, delete_transaction_id = ? WHERE id = ?",
+                    [(now, transaction_id, tid) for tid in track_ids])
     conn.commit()
 
 def unmark_tracks_deleted(conn, track_ids: List[str]):
     if not track_ids: return
     cur = conn.cursor()
-    cur.execute(f"UPDATE track SET is_deleted = 0, deleted_at = NULL, delete_transaction_id = NULL WHERE id IN ({','.join(['?']*len(track_ids))})", track_ids)
+    cur.executemany("UPDATE track SET is_deleted = 0, deleted_at = NULL, delete_transaction_id = NULL WHERE id = ?",
+                    [(tid,) for tid in track_ids])
     conn.commit()
 
 def get_transaction(conn, trans_id: int) -> Optional[Transaction]:
@@ -227,16 +229,17 @@ def get_tracks_by_transaction(conn, trans_id: int, trans_type: str) -> List[Trac
 def get_tracks_by_ids(conn, track_ids: List[str]) -> List[Track]:
     if not track_ids: return []
     cur = conn.cursor()
-    placeholders = ','.join(['?'] * len(track_ids))
-    cur.execute(f"SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id FROM track WHERE id IN ({placeholders})", track_ids)
-    
     tracks = []
-    for row in cur.fetchall():
-        tracks.append(Track(id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
-            last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
-            added_at=datetime.fromisoformat(row[7]) if row[7] else None,
-            deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            is_deleted=bool(row[9]), add_transaction_id=row[10], delete_transaction_id=row[11]))
+    # Per-id parameterized lookups: no dynamic SQL, no SQLite variable limit
+    for tid in track_ids:
+        cur.execute("SELECT id, name, artist, album, duration_ms, storage_playlist_id, last_played_at, added_at, deleted_at, is_deleted, add_transaction_id, delete_transaction_id FROM track WHERE id = ?", (tid,))
+        row = cur.fetchone()
+        if row:
+            tracks.append(Track(id=row[0], name=row[1], artist=row[2], album=row[3], duration_ms=row[4], storage_playlist_id=row[5],
+                last_played_at=datetime.fromisoformat(row[6]) if row[6] else None,
+                added_at=datetime.fromisoformat(row[7]) if row[7] else None,
+                deleted_at=datetime.fromisoformat(row[8]) if row[8] else None,
+                is_deleted=bool(row[9]), add_transaction_id=row[10], delete_transaction_id=row[11]))
     return tracks
 
 def get_all_active_tracks(conn) -> List[Track]:
@@ -318,6 +321,15 @@ def get_playlist_track_count(conn, playlist_id: str) -> int:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM track WHERE storage_playlist_id = ? AND is_deleted = 0", (playlist_id,))
     return cur.fetchone()[0]
+
+def update_storage_playlist_id(conn, track_ids: list[str], playlist_id: str):
+    """Points the given tracks' storage_playlist_id at playlist_id."""
+    if not track_ids:
+        return
+    cur = conn.cursor()
+    cur.executemany("UPDATE track SET storage_playlist_id = ? WHERE id = ?",
+                    [(playlist_id, tid) for tid in track_ids])
+    conn.commit()
 
 def add_to_duplicate_allowlist(conn, track_ids: List[str]):
     """Allow all pairs in the list to coexist."""

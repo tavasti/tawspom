@@ -56,6 +56,20 @@ SPOTIFY_MAX_RETRIES = 3
 # Delay between retries (seconds)
 SPOTIFY_RETRY_DELAY = 2
 
+# --- Spotify Web API Rate Limiting ---
+# Spotify applies a rolling ~30s request-rate limit (no published number; the
+# dev-mode ceiling is low). We pace ALL API calls client-side to stay safely
+# under it, so a 429 (and its long Retry-After pause) should not happen at all.
+SPOTIFY_RATE_WINDOW_SECONDS = 30
+SPOTIFY_RATE_MAX_REQUESTS = 100
+# If a 429's Retry-After exceeds this, stop cleanly instead of sleeping for it
+# (the command is resumable: just re-run it). Prevents multi-hour hangs.
+SPOTIFY_MAX_RETRY_AFTER_SECONDS = 600
+# Fallback wait (seconds) when a 429 carries no usable Retry-After header
+SPOTIFY_RETRY_AFTER_DEFAULT_SECONDS = 30
+# Max consecutive 429 waits for a single logical call before giving up
+SPOTIFY_MAX_RATE_LIMIT_WAITS = 3
+
 # Keywords to skip when fetching artist albums (unless specifically requested)
 ALBUM_SKIP_KEYWORDS = ["live", "deluxe", "expanded", "bonus", "edition", "super"]
 # Search result limit for artists
