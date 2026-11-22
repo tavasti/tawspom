@@ -95,14 +95,14 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 ### 4.2 Duplicate Copies (recreate)
 
 - **Add-Path Guard**: Every command that adds tracks to a playlist (ingest, canceldelete, canceladd, addartist, findnew, refill, phone history) first reads the target playlist's current track IDs and skips tracks that are already present, so the same track can never be added twice to the same playlist. Skipped (already-present) tracks are reported.
-- **recreate Command**: Rebuilds a single A-Z storage playlist so it exactly matches the DB's active tracks for that letter (recovery tool for duplicated, corrupted, or misplaced playlist content; also moves a collection to a different Spotify account).
+- **recreate Command**: Rebuilds a single A-Z storage playlist so it exactly matches the DB's mapping for that playlist (recovery tool for duplicated, corrupted, or misplaced playlist content). The DB is the source of truth and the command performs **no DB writes**.
     1. Usage: `recreate <letter>` (a single A-Z letter).
-    2. **Refill set**: every active DB track whose name maps to that letter — computed by letter, not by stored playlist ID, which is what makes account moves work.
-    3. **Pre-clear verification**: before anything is removed, every track currently in the playlist must resolve in the DB. Unknown (not in DB) or deleted tracks **abort the operation before anything is touched**.
-    4. **Rescue**: tracks that belong to a different letter are first added to that letter's own playlist (aborts if that playlist cannot be uniquely resolved), so the clear cannot lose them.
-    5. After a summary and a single confirmation: the playlist is cleared and refilled with the refill set, and the DB mapping of the refilled (and rescued) tracks is normalized to the target playlist ID.
-    6. **Post-refill verification**: the playlist is re-read and compared against the refill set; any mismatch is reported as a warning.
-    - **Safety**: one confirmation per run; aborts if the target letter resolves to multiple playlists; a missing playlist is only created with explicit confirmation; never touches DB deletion state (the DB is the source of truth — run `sync` first if it is not current).
+    2. **Refill set**: every active DB track mapped to that exact playlist (by stored playlist ID).
+    3. **Classification**: the current playlist content is compared against the refill set. Duplicate copies are removed. Extra tracks are removed in three cases, each listed by name in the preview: the DB maps it to another existing playlist (it is **first guaranteed present there** via dedup add, then removed from here — a track can never end up in no playlist, so a later sync can never mark it deleted by mistake), the DB marks it deleted (leftover residue; the deleted state is never changed), or it is unknown to the DB (e.g. a manually added song; names are bulk-fetched from the API for the preview).
+    4. **Safety aborts**: if the DB maps an extra track to a playlist that does not exist on this account, or a move destination cannot be guaranteed, the run aborts before any change.
+    5. After a preview and a single confirmation: the move destinations are guaranteed first, then the playlist is cleared and refilled with the refill set (same playlist ID, so the DB's `storage_playlist_id` references stay valid).
+    6. **Post-refill verification**: the playlist is re-read and compared against the refill set; a mismatch is reported as a warning, and re-running the command self-heals.
+    - **Safety**: the target playlist must exist exactly once — it is never created or guessed; one confirmation per run; `is_deleted` is never written (run `sync` first if the DB is not current).
 
 ### 4.3 Semantic Deduplication (findversions)
 
@@ -155,7 +155,7 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
 
 ### 6.2 Storage Playlist Recreation (recreate)
 
-- Rebuilds a single A-Z storage playlist so it exactly matches the DB's active tracks for that letter, with pre-clear verification and post-refill verification. See section 4.2 for the full behavior and safety guarantees.
+- Rebuilds a single A-Z storage playlist so it exactly matches the DB's mapping for that playlist, with move guarantees, pre-clear safety aborts, and post-refill verification. See section 4.2 for the full behavior and safety guarantees.
 
 ---
 

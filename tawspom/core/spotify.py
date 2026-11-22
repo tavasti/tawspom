@@ -381,6 +381,21 @@ class SpotifyClient:
             offset += limit
         return total_ms
 
+    def get_track_summaries(self, track_ids: list[str]) -> dict[str, str]:
+        """Bulk-fetches 'artist - name' labels for track IDs (50 per API call).
+        Used by recreate to preview tracks that are unknown to the database."""
+        labels: dict[str, str] = {}
+        for i in range(0, len(track_ids), 50):
+            chunk = track_ids[i:i + 50]
+            data = self._call_with_retry(self.sp.tracks, ids=chunk)
+            for item in (data or {}).get("tracks") or []:
+                if not item:
+                    continue
+                artists = ", ".join(a.get("name", "") for a in (item.get("artists") or []))
+                name = item.get("name") or "?"
+                labels[item["id"]] = f"{artists} - {name}" if artists else name
+        return labels
+
     def get_liked_songs(self) -> list[Track]:
         """Fetches all tracks from 'Liked Songs'."""
         tracks = []

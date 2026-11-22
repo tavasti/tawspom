@@ -105,7 +105,10 @@ class TestAddTracksUnique(unittest.TestCase):
 
 
 class TestRecreateStoragePlaylist(unittest.TestCase):
-    """Bug 3b: 'recreate' rebuilds one storage playlist from the DB, safely."""
+    """recreate v3: rebuilds one storage playlist so it exactly matches the
+    DB mapping (DB is the source of truth). Zero DB writes. Extra tracks the
+    DB maps to another playlist are guaranteed present there before removal.
+    One confirmation per run."""
 
     def test_invalid_letter_rejected(self):
         for bad in ("", "AB", "1", "Ä"):
@@ -121,69 +124,107 @@ class TestRecreateStoragePlaylist(unittest.TestCase):
         mgr.sp.clear_playlist.assert_not_called()
         mgr.sp.add_tracks_to_playlist.assert_not_called()
 
-    def test_missing_playlist_declined(self):
+    def test_missing_playlist_aborts_without_create(self):
         mgr = make_manager()
         mgr.sp.get_storage_playlists.return_value = []
-        with patch("builtins.input", return_value="n"):
+        with patch("builtins.input") as inp:
             mgr.recreate_storage_playlist("A")
+        inp.assert_not_called()
         mgr.sp.create_playlist.assert_not_called()
         mgr.sp.clear_playlist.assert_not_called()
 
-    def test_happy_path_with_dup_misplaced_and_missing(self):
-        """Dups removed, misplaced track rescued, missing track added, DB normalized."""
+    def test_happy_path_dups_move_deleted_unknown_missing(self):
+        """Dups removed; extra mapped to 'W' guaranteed there first; deleted and
+        unknown extras removed; missing track added; zero DB writes."""
         mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A"), Playlist("p2", "B")]
-        # reads: target 'A' content, rescue target 'B' content, final verification
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A"), Playlist("p2", "W")]
+        mgr.sp.get_track_summaries = lambda ids: {tid: f"Ghost - {tid}" for tid in ids}
+        # reads: 'A' content, 'W' content (dedup read for the move), final verification
         mgr.sp.get_playlist_tracks_ordered.side_effect = [
-            ["a1", "a2", "b1", "a1"],
-            ["b2"],
+            ["a1", "a2", "a1", "w1", "gone", "ghost"],
+            ["w2"],
             ["a1", "a2", "a3"],
         ]
-        tracks = [make_track("a1", "Alpha"), make_track("a2", "Act"),
-                  make_track("a3", "Apple"), make_track("b1", "Beta", "p2")]
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
-             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks), \
-             patch("tawspom.core.manager.update_storage_playlist_id") as upd, \
+        w_contents = ["w2"]
+        def fake_unique(pl_id, tids):
+            to_add = [t for t in tids if t not in w_contents]
+            skipped = [t for t in tids if t in w_contents]
+            if to_add:
+                mgr.sp.add_tracks_to_playlist(pl_id, to_add)
+            return to_add, skipped
+        mgr.sp.add_tracks_to_playlist_unique = fake_unique
+        a1 = make_track("a1", "Alpha")
+        a2 = make_track("a2", "Act")
+        a3 = make_track("a3", "Apple")
+        w1 = make_track("w1", "Whiter", "p2")
+        gone = make_track("gone", "Gone", is_deleted=True)
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, a2, a3, w1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[w1, gone]) as by_ids, \
+             patch("builtins.input", return_value="y"):
+            mgr.recreate_storage_playlist("A")
+
+        by_ids.assert_called_once_with(mgr.db, ["w1", "gone", "ghost"])
+        mgr.sp.clear_playlist.assert_called_once_with("p1")
+        add_calls = mgr.sp.add_tracks_to_playlist.call_args_list
+        self.assertIn(call("p2", ["w1"]), add_calls)               # move guarantee
+        self.assertIn(call("p1", ["a1", "a2", "a3"]), add_calls)   # refill
+        self.assertEqual(mgr.db.method_calls, [])                   # zero DB writes
+
+    def test_move_skips_tracks_already_in_destination(self):
+        """Extra already present in its DB-mapped playlist: only removed from target."""
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A"), Playlist("p2", "W")]
+        # reads: 'A' content, 'W' content (w1 already there), final verification
+        mgr.sp.get_playlist_tracks_ordered.side_effect = [
+            ["a1", "w1"],
+            ["w1", "w2"],
+            ["a1"],
+        ]
+        w_contents = ["w1", "w2"]
+        def fake_unique(pl_id, tids):
+            to_add = [t for t in tids if t not in w_contents]
+            skipped = [t for t in tids if t in w_contents]
+            if to_add:
+                mgr.sp.add_tracks_to_playlist(pl_id, to_add)
+            return to_add, skipped
+        mgr.sp.add_tracks_to_playlist_unique = fake_unique
+        a1 = make_track("a1", "Alpha")
+        w1 = make_track("w1", "Whiter", "p2")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, w1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[w1]), \
              patch("builtins.input", return_value="y"):
             mgr.recreate_storage_playlist("A")
 
         mgr.sp.clear_playlist.assert_called_once_with("p1")
         add_calls = mgr.sp.add_tracks_to_playlist.call_args_list
-        self.assertIn(call("p2", ["b1"]), add_calls)            # rescue
-        self.assertIn(call("p1", ["a1", "a2", "a3"]), add_calls)  # refill
-        upd.assert_any_call(mgr.db, ["a1", "a2", "a3"], "p1")
-        upd.assert_any_call(mgr.db, ["b1"], "p2")
+        self.assertNotIn(call("p2", ["w1"]), add_calls)   # no re-add to W
+        self.assertIn(call("p1", ["a1"]), add_calls)
 
-    def test_unknown_track_aborts_before_clear(self):
+    def test_unresolvable_destination_aborts_before_any_change(self):
+        """Extra mapped to a playlist that does not exist on this account: abort, nothing lost."""
         mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
-        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "ghost"]
-        tracks = [make_track("a1", "Alpha")]
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
-             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks):
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]  # no playlist for p9
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "w1"]
+        a1 = make_track("a1", "Alpha")
+        w1 = make_track("w1", "Whiter", "p9")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, w1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[w1]), \
+             patch("builtins.input") as inp:
             mgr.recreate_storage_playlist("A")
+        inp.assert_not_called()
         mgr.sp.clear_playlist.assert_not_called()
         mgr.sp.add_tracks_to_playlist.assert_not_called()
 
-    def test_deleted_track_aborts_before_clear(self):
+    def test_move_phase_failure_aborts_before_clear(self):
         mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
-        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "gone"]
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A"), Playlist("p2", "W")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "w1"]
+        mgr.sp.add_tracks_to_playlist_unique.side_effect = SpotifyException(404, 0, "not found")
         a1 = make_track("a1", "Alpha")
-        gone = make_track("gone", "Gone", is_deleted=True)
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1]), \
-             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[a1, gone]):
-            mgr.recreate_storage_playlist("A")
-        mgr.sp.clear_playlist.assert_not_called()
-
-    def test_rescue_target_unresolvable_aborts(self):
-        """Misplaced track whose own letter has no playlist: abort, don't lose it."""
-        mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]  # no 'B'
-        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "b1"]
-        tracks = [make_track("a1", "Alpha"), make_track("b1", "Beta", "p2")]
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
-             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks):
+        w1 = make_track("w1", "Whiter", "p2")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, w1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[w1]), \
+             patch("builtins.input", return_value="y"):
             mgr.recreate_storage_playlist("A")
         mgr.sp.clear_playlist.assert_not_called()
         mgr.sp.add_tracks_to_playlist.assert_not_called()
@@ -191,41 +232,57 @@ class TestRecreateStoragePlaylist(unittest.TestCase):
     def test_declined_confirmation_changes_nothing(self):
         mgr = make_manager()
         mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
-        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1"]
-        tracks = [make_track("a1", "Alpha")]
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
-             patch("tawspom.core.manager.get_tracks_by_ids", return_value=tracks), \
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "a1"]
+        a1 = make_track("a1", "Alpha")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[]), \
              patch("builtins.input", return_value="n"):
             mgr.recreate_storage_playlist("A")
         mgr.sp.clear_playlist.assert_not_called()
         mgr.sp.add_tracks_to_playlist.assert_not_called()
 
-    def test_missing_playlist_created_and_refilled(self):
+    def test_nothing_to_do_no_prompt(self):
         mgr = make_manager()
-        mgr.sp.get_storage_playlists.return_value = []
-        mgr.sp.create_playlist.return_value = Playlist("new1", "A")
-        # reads: new playlist content (empty), final verification
-        mgr.sp.get_playlist_tracks_ordered.side_effect = [[], ["a1"]]
-        tracks = [make_track("a1", "Alpha")]
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=tracks), \
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        mgr.sp.get_playlist_tracks_ordered.return_value = ["a1", "a2"]
+        a1 = make_track("a1", "Alpha")
+        a2 = make_track("a2", "Act")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, a2]), \
              patch("tawspom.core.manager.get_tracks_by_ids", return_value=[]), \
-             patch("tawspom.core.manager.update_storage_playlist_id") as upd, \
-             patch("builtins.input", side_effect=["y", "y"]):
-            mgr.recreate_storage_playlist("a")  # lowercase is normalized
-
-        mgr.sp.create_playlist.assert_called_once_with("A")
-        mgr.sp.clear_playlist.assert_called_once_with("new1")
-        mgr.sp.add_tracks_to_playlist.assert_called_once_with("new1", ["a1"])
-        upd.assert_called_once_with(mgr.db, ["a1"], "new1")
+             patch("builtins.input") as inp:
+            mgr.recreate_storage_playlist("A")
+        inp.assert_not_called()
+        mgr.sp.clear_playlist.assert_not_called()
+        mgr.sp.add_tracks_to_playlist.assert_not_called()
 
     def test_empty_playlist_and_empty_db_noop(self):
         mgr = make_manager()
         mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
         mgr.sp.get_playlist_tracks_ordered.return_value = []
-        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[]):
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[]), \
+             patch("builtins.input") as inp:
             mgr.recreate_storage_playlist("A")
+        inp.assert_not_called()
         mgr.sp.clear_playlist.assert_not_called()
         mgr.sp.add_tracks_to_playlist.assert_not_called()
+
+    def test_verification_reports_mismatch(self):
+        """A final read that doesn't match the refill set is reported, not raised."""
+        mgr = make_manager()
+        mgr.sp.get_storage_playlists.return_value = [Playlist("p1", "A")]
+        # reads: 'A' content, final verification (a2 lost)
+        mgr.sp.get_playlist_tracks_ordered.side_effect = [
+            ["a1"],
+            ["a1"],
+        ]
+        a1 = make_track("a1", "Alpha")
+        a2 = make_track("a2", "Act")
+        with patch("tawspom.core.manager.get_all_active_tracks", return_value=[a1, a2]), \
+             patch("tawspom.core.manager.get_tracks_by_ids", return_value=[]), \
+             patch("builtins.input", return_value="y"):
+            mgr.recreate_storage_playlist("A")
+        mgr.sp.clear_playlist.assert_called_once_with("p1")
+        mgr.sp.add_tracks_to_playlist.assert_called_once_with("p1", ["a1", "a2"])
 
 
 class TestFindSuspiciousPlaylists(unittest.TestCase):
