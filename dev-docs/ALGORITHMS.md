@@ -28,13 +28,14 @@
 4. Fetch candidate pool:
    - DB query: oldest last_played_at first, NULLs first
    - Limit: REFILL_CANDIDATE_POOL_SIZE (2000)
+   - Shuffle pool (randomize selection order within the pool)
 
 5. Initialize artist locks:
    - Look at last REFILL_ARTIST_LOCK_WINDOW (5) tracks in current playlist
    - Lock each artist for remaining distance from end
 
-6. Select tracks (oldest-first with artist lock):
-   FOR each track in pool (oldest first):
+6. Select tracks (random within pool, artist lock):
+   FOR each track in shuffled pool:
      - Skip if already in playlist
      - Skip if any artist is locked (lock index > current fill index)
      - ADD track → lock its artists for next REFILL_ARTIST_LOCK_WINDOW tracks

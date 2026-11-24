@@ -59,7 +59,8 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
   - **Momentum**: Total time listened in the window defined by `MOMENTUM_WINDOW_DAYS` (Default: 7 days).
   - **Queue Health**: Date of the oldest song waiting in the queue and top 3 artists currently at the front of the queue (identified from a pool of size `DASHBOARD_OLD_POOL_SIZE`, Default: 1000).
 - **Refill Logic (Time-Queue with Spreading)**:
-  - **Oldest First**: Candidate tracks are fetched in absolute order of their `last_played_at` date (ascending).
+  - **Oldest First**: Candidate tracks are fetched in absolute order of their `last_played_at` date (ascending, never-listened first).
+  - **Randomized Selection**: The fetched pool is shuffled, so tracks are consumed in random order within it. Unheard tracks therefore appear at their pool share (e.g. 10 new songs in a 2000-track pool ≈ 1 per refill) instead of always being drained before any re-listened track; recently played tracks outside the pool can never jump the queue.
   - **Spreading Lock**: Once an artist is added to the playlist, they (and their collaborators) are locked for the next `REFILL_ARTIST_LOCK_WINDOW` tracks (Default: 5).
   - **Exhaustive Search**: The system scans up to `REFILL_CANDIDATE_POOL_SIZE` oldest candidates to find enough tracks that satisfy the variety window (Default: 2000).
 - **Statistical Reporting**: At the end of each refill, the system reports the play count distribution of the newly added tracks (**Low, Average, Median, High**).

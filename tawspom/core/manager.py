@@ -1394,6 +1394,9 @@ class Manager:
 
         print(f"Adding music to reach {target_hours} hours. Currently at {current_duration_ms / 3600000:.1f} hours.")
         pool = get_least_recently_played_tracks(self.db, limit=REFILL_CANDIDATE_POOL_SIZE)
+        # Randomize within the pool so unheard tracks mix with re-listened ones
+        # (they appear at their pool share instead of always draining first)
+        random.shuffle(pool)
         
         artist_locks = {} 
         current_fill_index = 0
