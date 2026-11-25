@@ -55,7 +55,7 @@ The primary listening source is a configurable rolling window defined by `DEFAUL
   - **History**:
     - **Library listening time**: Cumulative listening for current (active) songs.
     - **with deleted songs**: Absolute lifetime listening including removed tracks.
-    - **Avg plays**: Average play count per track.
+    - **Avg plays**: Average play count per active track (deleted tracks are excluded).
   - **Momentum**: Total time listened in the window defined by `MOMENTUM_WINDOW_DAYS` (Default: 7 days).
   - **Queue Health**: Date of the oldest song waiting in the queue and top 3 artists currently at the front of the queue (identified from a pool of size `DASHBOARD_OLD_POOL_SIZE`, Default: 1000).
 - **Refill Logic (Time-Queue with Spreading)**:

@@ -388,10 +388,12 @@ def get_library_stats(conn) -> Dict:
     cur.execute("SELECT SUM(play_count * duration_ms) FROM track WHERE is_deleted = 0")
     active_history_ms = cur.fetchone()[0] or 0
     
-    cur.execute("SELECT SUM(play_count * duration_ms), AVG(play_count) FROM track")
-    full_history_ms, avg_plays = cur.fetchone()
-    full_history_ms = full_history_ms or 0
-    avg_plays = avg_plays or 0
+    cur.execute("SELECT SUM(play_count * duration_ms) FROM track")
+    full_history_ms = cur.fetchone()[0] or 0
+    
+    # Avg plays counts only active tracks (deleted tracks are excluded)
+    cur.execute("SELECT AVG(play_count) FROM track WHERE is_deleted = 0")
+    avg_plays = cur.fetchone()[0] or 0
     
     # 4. Momentum
     cutoff = (datetime.now() - timedelta(days=MOMENTUM_WINDOW_DAYS)).isoformat()
